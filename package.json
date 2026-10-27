@@ -21,7 +21,7 @@
       "shortcutName": "Muse"
     },
     "portable": {
-      "artifactName": "Muse-Portable-${version}.${ext}"
+      "artifactName": "Muse-Portable.${ext}"
     },
     "productName": "Muse",
     "win": {
@@ -53,5 +53,5 @@
     "start": "electron .",
     "test": "node tests/run-tests.js"
   },
-  "version": "0.5.2"
+  "version": "0.5.3"
 }

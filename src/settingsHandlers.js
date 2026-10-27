@@ -45,6 +45,7 @@ function registerSettingsHandlers(ipcMain, context) {
     appVersion: app.getVersion(),
     updateStatus: updateStatus(),
     autoCheckUpdates: context.settings.autoCheckUpdates !== false,
+    trayLeftClick: context.settings.trayLeftClick === 'settings' ? 'settings' : 'window',
   });
 
   ipcMain.handle('settings:get-state', () => currentState());
@@ -75,6 +76,17 @@ function registerSettingsHandlers(ipcMain, context) {
     context.settings.autoCheckUpdates = !!enabled;
     saveSettings(context.userDataPath, context.settings);
     console.log(`[settings] autoCheckUpdates set to ${context.settings.autoCheckUpdates}`);
+    return currentState();
+  });
+
+  // Tray left-click (0.5.3): 'settings' opens the settings window on
+  // a tray-icon left-click; anything else persists as 'window' (the
+  // toggle behavior). The tray reads the live setting at click time,
+  // so this applies immediately.
+  ipcMain.handle('settings:set-tray-left-click', (_event, action) => {
+    context.settings.trayLeftClick = action === 'settings' ? 'settings' : 'window';
+    saveSettings(context.userDataPath, context.settings);
+    console.log(`[settings] trayLeftClick set to ${context.settings.trayLeftClick}`);
     return currentState();
   });
 

@@ -13,7 +13,9 @@
 // capability (a stored "allow" is honored, "always allow" can be
 // granted on the prompt), no path to scope, gated + audited like the
 // rest. Its audit summary carries the captured dimensions — never
-// image data.
+// image data. screen.list (0.5.3) is capture's read-only companion:
+// it shares the screen.capture capability and its audit summary
+// carries the display count only.
 //
 // One audit line is appended per call (see bridgeAudit.js).
 //
@@ -38,6 +40,7 @@ const {
   ScreenCaptureError,
   validateCaptureParams,
   describeCaptureRequest,
+  describeListRequest,
 } = require('./screenCapture');
 
 const MAX_READ_BYTES = 1024 * 1024; // fs.read hard cap: 1 MB
@@ -68,15 +71,18 @@ const METHOD_CAPABILITY = {
   'process.kill': 'process.kill',
   'shell.run': 'shell.run',
   'screen.capture': 'screen.capture',
+  // screen.list shares the capture capability by design (0.5.3): one
+  // permissions.json key governs the whole screen family.
+  'screen.list': 'screen.capture',
 };
 
 const FS_METHODS = new Set(['fs.list', 'fs.read', 'fs.write', 'fs.mkdir']);
 // Methods refused with storage_moving while an assistant-folder move
 // runs: the fs tools (their scope is in flux), shell.run (its
-// working directory is the assistant folder being moved), and
-// screen.capture — the read-side methods all pause during a move,
-// and screen.capture follows its nearest siblings.
-const MOVING_REFUSED_METHODS = new Set([...FS_METHODS, 'shell.run', 'screen.capture']);
+// working directory is the assistant folder being moved), and the
+// screen family — the read-side methods all pause during a move,
+// and screen.capture / screen.list follow their nearest siblings.
+const MOVING_REFUSED_METHODS = new Set([...FS_METHODS, 'shell.run', 'screen.capture', 'screen.list']);
 const REFUSAL_CODES = new Set(['permission_denied', 'permission_timeout', 'scope_refused', 'storage_moving']);
 
 // ---------------------------------------------------------------------------
@@ -344,6 +350,10 @@ function paramsSummary(method, params, result) {
           ? { width: result.width, height: result.height }
           : {}),
       };
+    case 'screen.list':
+      // The count from the result, on success only — the Activity
+      // window renders "List displays: <count>" from it.
+      return result && Number.isInteger(result.count) ? { count: result.count } : {};
     default:
       return {};
   }
@@ -366,6 +376,8 @@ function promptDetail(method, params, resolvedPath) {
       // validated before the gate, so the numbers shown are the
       // numbers that will run.
       return describeCaptureRequest(params);
+    case 'screen.list':
+      return describeListRequest();
     default:
       return resolvedPath || String(params && params.path);
   }
@@ -381,6 +393,14 @@ function defaultCaptureScreen() {
   );
 }
 
+// Same for screen.list: the display provider lives in main.js
+// (Electron's screen module via screenCapture.js).
+function defaultListScreens() {
+  return Promise.reject(
+    new RpcError('tool_failed', 'Display listing is not available in this run.'),
+  );
+}
+
 function createRpcHandler(deps) {
   const {
     userDataPath,
@@ -393,6 +413,7 @@ function createRpcHandler(deps) {
     killProcess = defaultKillProcess,
     runShell = defaultRunShell,
     captureScreen = defaultCaptureScreen,
+    listScreens = defaultListScreens,
   } = deps;
 
   function audit(method, params, decision, outcome, errorCode, result) {
@@ -539,6 +560,16 @@ function createRpcHandler(deps) {
         // client sees the usual shape (invalid_params included).
         try {
           return await captureScreen(params);
+        } catch (err) {
+          if (err instanceof ScreenCaptureError) throw new RpcError(err.code, err.message);
+          throw err;
+        }
+      }
+      case 'screen.list': {
+        // Enumeration + normalization live in screenCapture.js, with
+        // the same error mapping as the capture.
+        try {
+          return await listScreens(params);
         } catch (err) {
           if (err instanceof ScreenCaptureError) throw new RpcError(err.code, err.message);
           throw err;

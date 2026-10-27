@@ -17,7 +17,18 @@ const DEFAULT_SETTINGS = {
   // 0.5.0: gates the updater's once-after-launch check only; a manual
   // "Check now" always runs.
   autoCheckUpdates: true,
+  // 0.5.3: what the tray icon's LEFT-click does — 'window' toggles the
+  // main window (the original behavior), 'settings' opens the
+  // settings window (the same action as the tray menu item).
+  trayLeftClick: 'window',
 };
+
+// The only trayLeftClick values with meaning; anything else (a
+// hand-edited settings.json, an older build's file) reads as the
+// default 'window'.
+function normalizeTrayLeftClick(value) {
+  return value === 'settings' ? 'settings' : 'window';
+}
 
 function saveSettings(userDataPath, values) {
   const file = path.join(userDataPath, 'settings.json');
@@ -50,6 +61,11 @@ function ensureSettings(userDataPath) {
     created = true;
   }
 
+  // Normalize the tray left-click action (0.5.3): an unrecognized
+  // value in the file falls back to 'window' rather than breaking
+  // the tray click.
+  values.trayLeftClick = normalizeTrayLeftClick(values.trayLeftClick);
+
   // Installer hand-off: the NSIS installer writes assistant-folder.txt into
   // userData with the assistant folder the user picked during setup. The
   // first run folds that choice into settings.json and removes the file, so
@@ -77,4 +93,4 @@ function ensureSettings(userDataPath) {
   return { values, file, created, fromInstaller };
 }
 
-module.exports = { ensureSettings, saveSettings, DEFAULT_SETTINGS };
+module.exports = { ensureSettings, saveSettings, DEFAULT_SETTINGS, normalizeTrayLeftClick };

@@ -4,7 +4,7 @@
 // (Phase 2).
 'use strict';
 
-const { app, globalShortcut, ipcMain, dialog, desktopCapturer } = require('electron');
+const { app, globalShortcut, ipcMain, dialog, desktopCapturer, screen } = require('electron');
 const os = require('os');
 const path = require('path');
 const { createMainWindow } = require('./mainWindow');
@@ -20,7 +20,7 @@ const { createActivityWindow, registerActivityHandlers } = require('./activityWi
 const { registerSettingsHandlers } = require('./settingsHandlers');
 const { ensureBridgeToken } = require('./bridgeAuth');
 const { createRpcHandler } = require('./rpc');
-const { createScreenCapture } = require('./screenCapture');
+const { createScreenCapture, createScreenList } = require('./screenCapture');
 const { createUpdater } = require('./updater');
 const { createPermissionPromptService } = require('./promptService');
 const { appendAuditLog } = require('./bridgeAudit');
@@ -289,6 +289,50 @@ if (!gotSingleInstanceLock) {
       captureScreen: createScreenCapture({
         getSources: (options) => desktopCapturer.getSources(options),
       }),
+      // 0.5.3: screen.list reads Electron's screen module. INDEX
+      // ALIGNMENT is the contract (see screenCapture.js): the list
+      // must be ordered the way desktopCapturer orders its screen
+      // sources, so an entry's index is capture's displayIndex for
+      // the same display. Both enumerations come from Electron, but
+      // the provider does not trust them to agree implicitly — it
+      // re-orders getAllDisplays() by matching each capturer
+      // source's display_id to the Display.id it belongs to, in
+      // source order. Displays the capturer did not enumerate keep
+      // their relative order at the end; if the capturer call fails
+      // outright, getAllDisplays() order is used as-is. width/height
+      // are DIP sizes (Display.size), scaleFactor and the primary
+      // flag ride along for the module to normalize.
+      listScreens: createScreenList({
+        getDisplays: async () => {
+          const displays = screen.getAllDisplays();
+          const primaryId = screen.getPrimaryDisplay().id;
+          let ordered = displays;
+          try {
+            const sources = await desktopCapturer.getSources({
+              types: ['screen'],
+              thumbnailSize: { width: 1, height: 1 },
+            });
+            const byId = new Map(displays.map((d) => [String(d.id), d]));
+            const aligned = [];
+            for (const source of sources) {
+              const match = byId.get(String(source.display_id));
+              if (match) {
+                aligned.push(match);
+                byId.delete(String(source.display_id));
+              }
+            }
+            ordered = [...aligned, ...byId.values()];
+          } catch {
+            // Capturer unavailable: fall back to screen-module order.
+          }
+          return ordered.map((d) => ({
+            width: d.size.width,
+            height: d.size.height,
+            scaleFactor: d.scaleFactor,
+            isPrimary: d.id === primaryId,
+          }));
+        },
+      }),
     });
 
     bridgeDeps = {
@@ -336,6 +380,8 @@ if (!gotSingleInstanceLock) {
     tray = createTray({
       onToggle: toggleWindow,
       onOpenSettings: openSettingsWindow,
+      // 0.5.3: the tray left-click reads the live setting per click.
+      getTrayLeftClick: () => context.settings.trayLeftClick,
       onOpenActivity: openActivityWindow,
       onCheckForUpdates: () => {
         if (updater) updater.check().catch(() => {});

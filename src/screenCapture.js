@@ -1,10 +1,12 @@
-// Screenshot capture for the Local Bridge (`screen.capture`, 0.5.1).
+// Screenshot capture for the Local Bridge (`screen.capture`, 0.5.1)
+// and its companion display enumeration (`screen.list`, 0.5.3).
 //
 // Electron-free by design (same injection pattern as rpc.js /
-// updater.js): the OS-level capturer is injected, so the whole module
-// — parameter validation, display selection, downscale math — is
-// unit-testable in plain Node with a fake capturer. main.js wires the
-// real one from Electron's desktopCapturer.getSources.
+// updater.js): the OS-level capturer and display provider are
+// injected, so the whole module — parameter validation, display
+// selection, downscale math, list normalization — is unit-testable
+// in plain Node with fakes. main.js wires the real ones from
+// Electron's desktopCapturer.getSources and screen module.
 //
 // The capture contract:
 //   params (all optional): displayIndex (default 0 = the first screen
@@ -13,6 +15,20 @@
 //   result: { format: 'png', width, height, displayIndex, dataBase64 }
 //     — the PNG bytes of the final image, base64-encoded; width/height
 //     are the FINAL image's dimensions (after any downscale).
+//
+// The list contract (0.5.3): no params.
+//   result: { displays: [{ index, width, height, scaleFactor,
+//     isPrimary }], count }
+// INDEX ALIGNMENT IS THE CONTRACT: entry `index` is the display's
+// position in the provider's enumeration, and the provider MUST
+// enumerate in the same order desktopCapturer enumerates its screen
+// sources, so `index` here is exactly the `displayIndex` a caller
+// passes to screen.capture for the same physical display. main.js
+// enforces the alignment by matching Electron display ids to
+// capturer source display_ids (see its wiring comment).
+//   width/height are the display's size in device-independent
+//   pixels (Electron's Display.size); scaleFactor is the display's
+//   DPI scale (1 = 100%); isPrimary marks the primary display.
 //
 // Errors are ScreenCaptureError with a stable `.code`; rpc.js maps
 // them onto RpcError so the client sees the usual error shape.
@@ -146,6 +162,66 @@ function createScreenCapture({ getSources } = {}) {
   return captureScreen;
 }
 
+// ---------------------------------------------------------------------------
+// screen.list (0.5.3): display enumeration, companion to the capture
+// ---------------------------------------------------------------------------
+
+// The one-line summary the permission prompt shows for screen.list.
+function describeListRequest() {
+  return 'List displays';
+}
+
+// Normalize raw provider entries ({ width, height, scaleFactor,
+// isPrimary }, already in capture-source order — see the header
+// contract) into the wire shape. Pure and strict about size: a
+// display without a positive size means the provider is broken,
+// which is a tool_failed, not a list entry. A missing/invalid
+// scaleFactor falls back to 1 (100%) rather than failing the whole
+// enumeration; isPrimary is a plain boolean coercion.
+function normalizeDisplays(rawDisplays) {
+  if (!Array.isArray(rawDisplays)) {
+    throw new ScreenCaptureError('tool_failed', 'The display provider returned no display list.');
+  }
+  return rawDisplays.map((raw, index) => {
+    const width = raw && raw.width;
+    const height = raw && raw.height;
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      throw new ScreenCaptureError('tool_failed', 'A display came back with no size.');
+    }
+    const scaleFactor =
+      Number.isFinite(raw.scaleFactor) && raw.scaleFactor > 0 ? raw.scaleFactor : 1;
+    return { index, width, height, scaleFactor, isPrimary: Boolean(raw.isPrimary) };
+  });
+}
+
+// getDisplays is injected: () => Promise<rawDisplay[]> (entries
+// shaped for normalizeDisplays, in capture-source order). An empty
+// machine enumeration is the same `no_screens` the capture reports.
+function createScreenList({ getDisplays } = {}) {
+  if (typeof getDisplays !== 'function') {
+    throw new TypeError('createScreenList requires a getDisplays function.');
+  }
+
+  async function listScreens() {
+    let raw;
+    try {
+      raw = await getDisplays();
+    } catch (err) {
+      throw new ScreenCaptureError(
+        'tool_failed',
+        `Display listing failed: ${err && err.message ? err.message : String(err)}`,
+      );
+    }
+    const displays = normalizeDisplays(raw);
+    if (displays.length === 0) {
+      throw new ScreenCaptureError('no_screens', 'No screens are available to list.');
+    }
+    return { displays, count: displays.length };
+  }
+
+  return listScreens;
+}
+
 module.exports = {
   ScreenCaptureError,
   DEFAULT_DISPLAY_INDEX,
@@ -156,4 +232,7 @@ module.exports = {
   describeCaptureRequest,
   computeScaledSize,
   createScreenCapture,
+  describeListRequest,
+  normalizeDisplays,
+  createScreenList,
 };

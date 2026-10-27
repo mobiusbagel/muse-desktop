@@ -112,8 +112,15 @@ function isNewerVersion(candidate, current) {
 // Release JSON
 // ---------------------------------------------------------------------------
 
-function exeAssetName(version) {
-  return `Muse-Portable-${version}.exe`;
+// From 0.5.3 the portable's name is version-free: the release asset
+// is ALWAYS Muse-Portable.exe, for every future release. The
+// version lives in the release tag and in the app's Settings window,
+// not in the filename — and an in-app apply replaces the running
+// file's contents under whatever name it already has.
+const EXE_ASSET_NAME = 'Muse-Portable.exe';
+
+function exeAssetName() {
+  return EXE_ASSET_NAME;
 }
 
 // Turns a GitHub "latest release" payload into an offer, or explains
@@ -127,7 +134,7 @@ function parseLatestRelease(json, currentVersion) {
   if (!parseVersion(version)) return { offer: null, reason: 'bad-tag' };
   if (!isNewerVersion(version, currentVersion)) return { offer: null, reason: 'not-newer' };
   const assets = Array.isArray(json.assets) ? json.assets : [];
-  const exeName = exeAssetName(version);
+  const exeName = exeAssetName();
   const exe = assets.find((a) => a && a.name === exeName);
   if (!exe || typeof exe.browser_download_url !== 'string') {
     return { offer: null, reason: 'missing-exe-asset' };
@@ -749,6 +756,7 @@ module.exports = {
   GITHUB_REPO,
   LATEST_RELEASE_URL,
   SUMS_ASSET_NAME,
+  EXE_ASSET_NAME,
   parseVersion,
   compareVersions,
   isNewerVersion,

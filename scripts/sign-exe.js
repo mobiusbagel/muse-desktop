@@ -33,7 +33,7 @@
 // Usage:
 //   node scripts/sign-exe.js            sign inner + outer (whichever exist)
 //   node scripts/sign-exe.js inner      sign dist/win-unpacked/Muse.exe only
-//   node scripts/sign-exe.js outer      sign dist/Muse-Portable-<version>.exe only
+//   node scripts/sign-exe.js outer      sign dist/Muse-Portable.exe only
 //   node scripts/sign-exe.js <exe>      sign that file
 // Every file is verified with `osslsigncode verify` right after signing;
 // any failure exits non-zero.
@@ -116,7 +116,7 @@ function signOne(filePath) {
 function main() {
   const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
   const inner = path.join(projectRoot, 'dist', 'win-unpacked', 'Muse.exe');
-  const outer = path.join(projectRoot, 'dist', `Muse-Portable-${pkg.version}.exe`);
+  const outer = path.join(projectRoot, 'dist', 'Muse-Portable.exe');
   const arg = process.argv[2];
 
   let targets;

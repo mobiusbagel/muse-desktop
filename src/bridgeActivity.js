@@ -71,6 +71,9 @@ function describeEntry(entry) {
     case 'screen.capture':
       // Dimensions ride in the audit summary (never image data).
       return params.width && params.height ? `Screenshot: ${params.width}x${params.height}` : 'Screenshot';
+    case 'screen.list':
+      // The display count rides in the audit summary.
+      return Number.isInteger(params.count) ? `List displays: ${params.count}` : 'List displays';
     case null:
     case undefined:
       if (entry.event === 'tailnet_listener_bound') {

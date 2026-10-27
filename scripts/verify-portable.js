@@ -20,7 +20,9 @@
 //
 // Usage:
 //   node scripts/verify-portable.js [portable-exe]
-//       (default: dist/Muse-Portable-<package.json version>.exe)
+//       (default: dist/Muse-Portable.exe — the portable's name is
+//        version-free from 0.5.3; the VERSION is still asserted from
+//        package.json against the exe's stamped FileVersion)
 //
 // Extraction uses 7-Zip: `7zz`/`7z` from PATH, else the copy in the
 // electron-builder cache. The extraction dir is created on the
@@ -97,7 +99,7 @@ async function main() {
   const expectedVersion = pkg.version;
   const portablePath = process.argv[2]
     ? path.resolve(process.argv[2])
-    : path.join(projectRoot, 'dist', `Muse-Portable-${expectedVersion}.exe`);
+    : path.join(projectRoot, 'dist', 'Muse-Portable.exe');
   if (!fs.existsSync(portablePath)) fail(`portable artifact not found: ${portablePath}`);
 
   const sevenZip = find7z();

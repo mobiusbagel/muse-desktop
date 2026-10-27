@@ -25,8 +25,10 @@ on your PC, and a plain-language audit log of everything that happened.
 - **Local Bridge:** an HTTP API on `127.0.0.1:47631` with token auth,
   exposing permission-gated tools: `fs.list`, `fs.read`, `fs.write`,
   `fs.mkdir`, `app.launch`, `process.list`, `process.kill`,
-  `shell.run`, and `screen.capture` (a PNG screenshot of one display,
-  downscaled to at most 2560 px wide by default). Filesystem tools are
+  `shell.run`, `screen.capture` (a PNG screenshot of one display,
+  downscaled to at most 2560 px wide by default), and `screen.list`
+  (the connected displays — size, DPI scale factor and primary flag,
+  indexed to match `screen.capture`'s `displayIndex`). Filesystem tools are
   scoped to the assistant folder (plus folders you explicitly approve);
   every capability defaults to "ask" in `permissions.json`, and
   `shell.run` can never be set to always-allow — its prompt shows the
@@ -39,6 +41,9 @@ on your PC, and a plain-language audit log of everything that happened.
 - **Remote access (optional, off by default):** the bridge can also
   listen on your machine's Tailscale address — never a LAN or public
   address — with the same token and permission gates.
+- **Tray:** left-clicking the tray icon toggles the window by default;
+  a **Tray left-click** option in the settings window switches it to
+  opening the settings window instead. Takes effect immediately.
 - **In-app updates:** the app checks GitHub Releases, downloads the new
   portable build, and verifies it **twice** before offering it: the
   SHA-256 must match the release's `SHA256SUMS.txt`, **and** the
@@ -50,8 +55,10 @@ on your PC, and a plain-language audit log of everything that happened.
 
 ## Install
 
-1. Download `Muse-Portable-<version>.exe` from the
+1. Download `Muse-Portable.exe` from the
    [latest release](https://github.com/mobiusbagel/muse-desktop/releases/latest).
+   (The portable's name is version-free; the Settings window shows
+   the installed version.)
 2. Put it anywhere (Desktop is fine) and double-click.
 
 ### One-time certificate trust (and an honest SmartScreen note)

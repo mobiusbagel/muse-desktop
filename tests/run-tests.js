@@ -37,6 +37,16 @@
 // fake capturer (downscale math, display selection, out-of-range /
 // no-screens errors), the moving-state refusal, and an audit summary
 // that carries dimensions but never image data.
+// 0.5.3 coverage: screen.list (screenCapture.js + the rpc wiring) —
+// the list shape from a fake display provider (primary not first,
+// scaleFactor passthrough), index alignment with the capture source
+// ordering as encoded in the module, shared-capability gating (the
+// screen.capture key: ask prompts, stored "allow" honored), the
+// moving-state refusal, the Activity describe line, and metadata-only
+// audit summaries. Also 0.5.3: the version-free portable name (the
+// updater's exe asset is the constant Muse-Portable.exe) and the
+// tray left-click setting (dispatch, 'window' default incl. legacy
+// settings files, settings.json round-trip, settings-window wiring).
 // Run: npm test
 'use strict';
 
@@ -46,7 +56,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { createRpcHandler, _internals } = require('../src/rpc');
+const { createRpcHandler, METHOD_CAPABILITY, _internals } = require('../src/rpc');
 const {
   effectivePolicyMode,
   sanitizePromptAnswer,
@@ -60,6 +70,9 @@ const {
   describeCaptureRequest,
   computeScaledSize,
   createScreenCapture,
+  describeListRequest,
+  normalizeDisplays,
+  createScreenList,
 } = require('../src/screenCapture');
 const {
   parseAuditLogText,
@@ -72,7 +85,13 @@ const { ensureBridgeToken, tokenMatches } = require('../src/bridgeAuth');
 const { startBridge, startBridgeSet } = require('../src/bridge');
 const { findTailscaleAddress, hasTailscaleAdapter, getBridgeStatus, isTailscaleIPv4 } = require('../src/bridgeNetwork');
 const { tasklistMentionsTailscale } = require('../src/tailscaleProbe');
-const { ensureSettings } = require('../src/settings');
+const {
+  ensureSettings,
+  saveSettings,
+  DEFAULT_SETTINGS: SETTINGS_DEFAULTS,
+  normalizeTrayLeftClick,
+} = require('../src/settings');
+const { trayLeftClickTarget } = require('../src/tray');
 const {
   getStorageInfo,
   ensureAssistantFolder,
@@ -84,6 +103,8 @@ const { precheckMove, moveAssistantFolder } = require('../src/moveFolder');
 const { formatBytes, formatPercent } = require('../src/formatBytes');
 const {
   PINNED_SIGNER_FINGERPRINT256,
+  EXE_ASSET_NAME,
+  exeAssetName,
   parseVersion,
   compareVersions,
   isNewerVersion,
@@ -1323,8 +1344,8 @@ function releaseJson(version, { withExe = true, withSums = true } = {}) {
   const assets = [];
   if (withExe) {
     assets.push({
-      name: `Muse-Portable-${version}.exe`,
-      browser_download_url: `https://example.test/Muse-Portable-${version}.exe`,
+      name: 'Muse-Portable.exe',
+      browser_download_url: 'https://example.test/Muse-Portable.exe',
     });
   }
   if (withSums) {
@@ -1335,10 +1356,11 @@ function releaseJson(version, { withExe = true, withSums = true } = {}) {
 
 const jsonFetch = (payload) => async () => ({ ok: true, status: 200, json: async () => payload });
 
-// The signed 0.5.2 portable in dist/ is the fixture for the real-cert
-// tests. Temp roots for updater runs live on the workspace disk (the
+// The signed portable in dist/ is the fixture for the real-cert
+// tests (its name is version-free from 0.5.3: Muse-Portable.exe).
+// Temp roots for updater runs live on the workspace disk (the
 // fixture is ~109 MB; /tmp is a small tmpfs on the build VM).
-const SIGNED_EXE_FIXTURE = path.join(__dirname, '..', 'dist', 'Muse-Portable-0.5.2.exe');
+const SIGNED_EXE_FIXTURE = path.join(__dirname, '..', 'dist', 'Muse-Portable.exe');
 const REAL_CERT_DER = path.join(__dirname, '..', 'signing', 'muse-signing-cert.cer');
 const haveUpdaterFixtures = fs.existsSync(SIGNED_EXE_FIXTURE) && fs.existsSync(REAL_CERT_DER);
 
@@ -1374,8 +1396,8 @@ test('0.5.0 release parsing: a newer release with both assets is an offer', () =
   const { offer, reason } = parseLatestRelease(releaseJson('0.6.0'), '0.5.0');
   assert.ok(offer, `expected an offer, got reason ${reason}`);
   assert.strictEqual(offer.version, '0.6.0');
-  assert.strictEqual(offer.exeName, 'Muse-Portable-0.6.0.exe');
-  assert.ok(offer.exeUrl.endsWith('Muse-Portable-0.6.0.exe'));
+  assert.strictEqual(offer.exeName, 'Muse-Portable.exe');
+  assert.ok(offer.exeUrl.endsWith('Muse-Portable.exe'));
   assert.ok(offer.sumsUrl.endsWith('SHA256SUMS.txt'));
 });
 
@@ -1395,8 +1417,8 @@ test('0.5.0 release parsing: not newer, missing asset, missing sums → no offer
 test('0.5.0 sums parsing: plain and binary-marker lines', () => {
   const h1 = 'a'.repeat(64);
   const h2 = 'b'.repeat(64);
-  const sums = parseSha256Sums(`${h1}  Muse-Portable-0.6.0.exe\n${h2} *Muse-win-unpacked-0.6.0.zip\r\n`);
-  assert.strictEqual(sums.get('Muse-Portable-0.6.0.exe'), h1);
+  const sums = parseSha256Sums(`${h1}  Muse-Portable.exe\n${h2} *Muse-win-unpacked-0.6.0.zip\r\n`);
+  assert.strictEqual(sums.get('Muse-Portable.exe'), h1);
   assert.strictEqual(sums.get('Muse-win-unpacked-0.6.0.zip'), h2);
   assert.strictEqual(sums.get('nope.exe'), undefined);
 });
@@ -1404,17 +1426,17 @@ test('0.5.0 sums parsing: plain and binary-marker lines', () => {
 test('0.5.0 checksum: a good file passes, a tampered file is rejected', async () => {
   const root = updaterTmpRoot('sum');
   try {
-    const exePath = path.join(root, 'Muse-Portable-9.9.9.exe');
+    const exePath = path.join(root, 'Muse-Portable.exe');
     const sumsPath = path.join(root, 'SHA256SUMS.txt');
     fs.writeFileSync(exePath, 'pretend exe bytes');
     const good = crypto.createHash('sha256').update('pretend exe bytes').digest('hex');
-    fs.writeFileSync(sumsPath, `${good}  Muse-Portable-9.9.9.exe\n`);
-    assert.strictEqual(await verifyChecksum(exePath, sumsPath, 'Muse-Portable-9.9.9.exe'), true);
+    fs.writeFileSync(sumsPath, `${good}  Muse-Portable.exe\n`);
+    assert.strictEqual(await verifyChecksum(exePath, sumsPath, 'Muse-Portable.exe'), true);
     fs.writeFileSync(exePath, 'pretend exe bytes!');
-    assert.strictEqual(await verifyChecksum(exePath, sumsPath, 'Muse-Portable-9.9.9.exe'), false, 'one byte flips the verdict');
+    assert.strictEqual(await verifyChecksum(exePath, sumsPath, 'Muse-Portable.exe'), false, 'one byte flips the verdict');
     fs.writeFileSync(sumsPath, `${good}  some-other-name.exe\n`);
     assert.strictEqual(
-      await verifyChecksum(exePath, sumsPath, 'Muse-Portable-9.9.9.exe'),
+      await verifyChecksum(exePath, sumsPath, 'Muse-Portable.exe'),
       false,
       'no line for this exe name → fail',
     );
@@ -1473,18 +1495,18 @@ test('0.5.0 verify composition: the real signed exe passes BOTH checks', async (
   }
   const root = updaterTmpRoot('verify');
   try {
-    const exePath = path.join(root, 'Muse-Portable-0.5.0.exe');
+    const exePath = path.join(root, 'Muse-Portable.exe');
     fs.copyFileSync(SIGNED_EXE_FIXTURE, exePath);
     const hash = crypto.createHash('sha256').update(fs.readFileSync(exePath)).digest('hex');
     const sumsPath = path.join(root, 'SHA256SUMS.txt');
-    fs.writeFileSync(sumsPath, `${hash}  Muse-Portable-0.5.0.exe\n`);
-    const verdict = await verifyDownloadedUpdate({ exePath, sumsPath, exeName: 'Muse-Portable-0.5.0.exe' });
+    fs.writeFileSync(sumsPath, `${hash}  Muse-Portable.exe\n`);
+    const verdict = await verifyDownloadedUpdate({ exePath, sumsPath, exeName: 'Muse-Portable.exe' });
     assert.deepStrictEqual(verdict, { ok: true });
     // Tamper: flip a byte in the middle → checksum must catch it first.
     const buf = fs.readFileSync(exePath);
     buf[buf.length >> 1] ^= 0xff;
     fs.writeFileSync(exePath, buf);
-    const tampered = await verifyDownloadedUpdate({ exePath, sumsPath, exeName: 'Muse-Portable-0.5.0.exe' });
+    const tampered = await verifyDownloadedUpdate({ exePath, sumsPath, exeName: 'Muse-Portable.exe' });
     assert.deepStrictEqual(tampered, { ok: false, reason: 'checksum-mismatch' });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -1513,7 +1535,7 @@ test('0.5.0 verify composition: a foreign signer is rejected even with a matchin
         '-in', path.join(root, 'c.pem'), '-passout', 'pass:test'],
       { stdio: 'pipe' },
     );
-    const exePath = path.join(root, 'Muse-Portable-0.5.0.exe');
+    const exePath = path.join(root, 'Muse-Portable.exe');
     const rawCopy = path.join(root, 'raw.exe');
     fs.copyFileSync(SIGNED_EXE_FIXTURE, rawCopy);
     execFileSync(
@@ -1523,10 +1545,10 @@ test('0.5.0 verify composition: a foreign signer is rejected even with a matchin
     );
     const hash = crypto.createHash('sha256').update(fs.readFileSync(exePath)).digest('hex');
     const sumsPath = path.join(root, 'SHA256SUMS.txt');
-    fs.writeFileSync(sumsPath, `${hash}  Muse-Portable-0.5.0.exe\n`);
-    const verdict = await verifyDownloadedUpdate({ exePath, sumsPath, exeName: 'Muse-Portable-0.5.0.exe' });
+    fs.writeFileSync(sumsPath, `${hash}  Muse-Portable.exe\n`);
+    const verdict = await verifyDownloadedUpdate({ exePath, sumsPath, exeName: 'Muse-Portable.exe' });
     assert.deepStrictEqual(verdict, { ok: false, reason: 'signer-mismatch' });
-    assert.strictEqual(await verifyChecksum(exePath, sumsPath, 'Muse-Portable-0.5.0.exe'), true, 'the checksum alone would have passed');
+    assert.strictEqual(await verifyChecksum(exePath, sumsPath, 'Muse-Portable.exe'), true, 'the checksum alone would have passed');
   } catch (err) {
     if (err.code === 'ENOENT') {
       console.log('     (skipped: openssl/osslsigncode unavailable)');
@@ -1559,7 +1581,7 @@ test('0.5.0 updater: fail-closed — a bad checksum blocks the offer, audits, de
       fetchImpl: jsonFetch(releaseJson('9.9.9')),
       downloadToFile: stubDownload([
         ['.exe', (dest) => fs.writeFileSync(dest, 'attacker bytes')],
-        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${'0'.repeat(64)}  Muse-Portable-9.9.9.exe\n`)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${'0'.repeat(64)}  Muse-Portable.exe\n`)],
       ]),
       audit: (entry) => audits.push(entry),
       onReady: () => {
@@ -1593,7 +1615,7 @@ test('0.5.0 updater: fail-closed — an unsigned exe with an honest checksum is 
       fetchImpl: jsonFetch(releaseJson('9.9.9')),
       downloadToFile: stubDownload([
         ['.exe', (dest) => fs.writeFileSync(dest, body)],
-        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${honest}  Muse-Portable-9.9.9.exe\n`)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${honest}  Muse-Portable.exe\n`)],
       ]),
       audit: (entry) => audits.push(entry),
       onReady: () => {
@@ -1655,7 +1677,7 @@ test('0.5.0 updater: verified download → ready; portable apply writes + launch
       fetchImpl: jsonFetch(releaseJson('9.9.9')),
       downloadToFile: stubDownload([
         ['.exe', (dest) => fs.copyFileSync(SIGNED_EXE_FIXTURE, dest)],
-        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable-9.9.9.exe\n`)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable.exe\n`)],
       ]),
       audit: (entry) => audits.push(entry),
       onReady: (info) => readyInfos.push(info),
@@ -1712,7 +1734,7 @@ test('0.5.0 updater: non-portable runs verify but cannot apply', async () => {
       fetchImpl: jsonFetch(releaseJson('9.9.9')),
       downloadToFile: stubDownload([
         ['.exe', (dest) => fs.copyFileSync(SIGNED_EXE_FIXTURE, dest)],
-        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable-9.9.9.exe\n`)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable.exe\n`)],
       ]),
       onReady: (info) => readyInfos.push(info),
     });
@@ -1827,7 +1849,7 @@ test('0.5.2 apply: a WMI launch failure falls back to the direct spawn and audit
       fetchImpl: jsonFetch(releaseJson('9.9.9')),
       downloadToFile: stubDownload([
         ['.exe', (dest) => fs.copyFileSync(SIGNED_EXE_FIXTURE, dest)],
-        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable-9.9.9.exe\n`)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable.exe\n`)],
       ]),
       audit: (entry) => audits.push(entry),
       launchSwapScript: () => {
@@ -2258,6 +2280,267 @@ test('0.5.1 activity: screenshot describe line', () => {
     'Screenshot: 2560x1440',
   );
   assert.strictEqual(describeEntry({ method: 'screen.capture', params: {} }), 'Screenshot');
+});
+
+// --- 0.5.3: screen.list ------------------------------------------------------
+
+// A fake display provider: raw entries ({ width, height, scaleFactor,
+// isPrimary }), already in capture-source order per the contract.
+function fakeGetDisplays(rawDisplays) {
+  return async () => rawDisplays;
+}
+
+// The shared fake monitor set: the primary is deliberately NOT first,
+// and the scale factors differ per display.
+const FAKE_MONITORS = [
+  { width: 1920, height: 1080, scaleFactor: 1, isPrimary: false },
+  { width: 2560, height: 1440, scaleFactor: 1.25, isPrimary: true },
+  { width: 1080, height: 1920, scaleFactor: 2, isPrimary: false },
+];
+
+test('0.5.3 screen.list: shape from a fake provider (primary not first, scaleFactor passthrough)', async () => {
+  const list = createScreenList({ getDisplays: fakeGetDisplays(FAKE_MONITORS) });
+  const result = await list();
+  assert.deepStrictEqual(result, {
+    displays: [
+      { index: 0, width: 1920, height: 1080, scaleFactor: 1, isPrimary: false },
+      { index: 1, width: 2560, height: 1440, scaleFactor: 1.25, isPrimary: true },
+      { index: 2, width: 1080, height: 1920, scaleFactor: 2, isPrimary: false },
+    ],
+    count: 3,
+  });
+});
+
+test('0.5.3 screen.list: normalization defaults (scaleFactor 1, isPrimary coerced)', () => {
+  assert.deepStrictEqual(
+    normalizeDisplays([{ width: 800, height: 600 }, { width: 1024, height: 768, scaleFactor: 0, isPrimary: 1 }]),
+    [
+      { index: 0, width: 800, height: 600, scaleFactor: 1, isPrimary: false },
+      { index: 1, width: 1024, height: 768, scaleFactor: 1, isPrimary: true },
+    ],
+  );
+});
+
+test('0.5.3 screen.list: provider failures are clean errors', async () => {
+  const none = createScreenList({ getDisplays: fakeGetDisplays([]) });
+  await expectCaptureError(none(), 'no_screens');
+  const broken = createScreenList({
+    getDisplays: async () => {
+      throw new Error('screen module exploded');
+    },
+  });
+  await expectCaptureError(broken(), 'tool_failed');
+  const badSize = createScreenList({ getDisplays: fakeGetDisplays([{ width: 0, height: 1080 }]) });
+  await expectCaptureError(badSize(), 'tool_failed');
+  const notAList = createScreenList({ getDisplays: async () => null });
+  await expectCaptureError(notAList(), 'tool_failed');
+});
+
+test('0.5.3 screen.list: indexes align with the capture source ordering', async () => {
+  // One shared fake enumeration feeds both factories, in the same
+  // order: that order IS the alignment contract the module encodes
+  // (and main.js enforces against the real enumerations by id).
+  const list = createScreenList({ getDisplays: fakeGetDisplays(FAKE_MONITORS) });
+  const capture = createScreenCapture({
+    getSources: fakeGetSources(FAKE_MONITORS.map((m) => fakeImage(m.width, m.height))),
+  });
+  const { displays } = await list();
+  for (const display of displays) {
+    const shot = await capture({ displayIndex: display.index });
+    assert.strictEqual(shot.displayIndex, display.index);
+    assert.strictEqual(shot.width, display.width, `display ${display.index} width lines up`);
+    assert.strictEqual(shot.height, display.height, `display ${display.index} height lines up`);
+  }
+});
+
+test('0.5.3 screen.list: shares the screen.capture capability (no new policy key)', () => {
+  assert.strictEqual(METHOD_CAPABILITY['screen.list'], 'screen.capture');
+  assert.strictEqual('screen.list' in DEFAULT_POLICY.capabilities, false, 'no screen.list key in the policy');
+  assert.strictEqual(describeListRequest(), 'List displays');
+});
+
+test('0.5.3 screen.list: a stored "allow" for screen.capture runs without prompting', async () => {
+  const env = makeEnv({ 'screen.capture': 'allow' });
+  let prompts = 0;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompts += 1;
+      return { allowed: true };
+    },
+    listScreens: createScreenList({ getDisplays: fakeGetDisplays(FAKE_MONITORS) }),
+  });
+  const result = await rpc('screen.list', {});
+  assert.strictEqual(result.count, 3);
+  assert.strictEqual(result.displays[1].isPrimary, true);
+  assert.strictEqual(prompts, 0, 'stored allow must skip the prompt for screen.list too');
+  const last = env.auditEntries().at(-1);
+  assert.strictEqual(last.method, 'screen.list');
+  assert.strictEqual(last.decision, 'allow');
+  assert.strictEqual(last.params.count, 3);
+});
+
+test('0.5.3 screen.list: ask prompts once with the one-line summary; denial refuses', async () => {
+  const env = makeEnv(); // screen.capture defaults to "ask"
+  const seen = [];
+  const rpc = makeHandler(env, {
+    prompt: async (req) => {
+      seen.push(req);
+      return { allowed: true };
+    },
+    listScreens: createScreenList({ getDisplays: fakeGetDisplays(FAKE_MONITORS) }),
+  });
+  await rpc('screen.list', {});
+  assert.strictEqual(seen.length, 1);
+  assert.strictEqual(seen[0].capability, 'screen.capture');
+  assert.strictEqual(seen[0].method, 'screen.list');
+  assert.strictEqual(seen[0].detail, 'List displays');
+  assert.strictEqual(seen[0].canAlwaysAllow, true);
+  assert.strictEqual(env.auditEntries().at(-1).decision, 'ask-granted');
+
+  const denyEnv = makeEnv();
+  const denyRpc = makeHandler(denyEnv, {
+    prompt: async () => ({ allowed: false }),
+    listScreens: createScreenList({ getDisplays: fakeGetDisplays(FAKE_MONITORS) }),
+  });
+  await expectRpcError(denyRpc('screen.list', {}), 'permission_denied');
+});
+
+test('0.5.3 screen.list: moving state refuses with storage_moving', async () => {
+  const env = makeEnv({ 'screen.capture': 'allow' });
+  let listed = 0;
+  const rpc = makeHandler(env, {
+    isMoving: () => true,
+    listScreens: async () => {
+      listed += 1;
+      return { displays: [], count: 0 };
+    },
+  });
+  await expectRpcError(rpc('screen.list', {}), 'storage_moving');
+  assert.strictEqual(listed, 0);
+  assert.strictEqual(env.auditEntries().at(-1).decision, 'storage-moving');
+});
+
+test('0.5.3 screen.list: audit stays metadata-only (count, never image data)', async () => {
+  const env = makeEnv({ 'screen.capture': 'allow' });
+  const rpc = makeHandler(env, {
+    listScreens: createScreenList({ getDisplays: fakeGetDisplays(FAKE_MONITORS) }),
+  });
+  await rpc('screen.list', {});
+  const rawLog = fs.readFileSync(path.join(env.userDataPath, 'bridge-audit.log'), 'utf8');
+  assert.ok(!rawLog.includes('dataBase64'), 'no image-data field in the audit entry');
+  assert.ok(!rawLog.includes('thumbnail'), 'no capture payload in the audit entry');
+  const entry = env.auditEntries().at(-1);
+  assert.deepStrictEqual(entry.params, { count: 3 });
+});
+
+test('0.5.3 screen.list: without a provider the method fails cleanly', async () => {
+  const env = makeEnv({ 'screen.capture': 'allow' });
+  const rpc = makeHandler(env, {});
+  await expectRpcError(rpc('screen.list', {}), 'tool_failed');
+});
+
+test('0.5.3 activity: list-displays describe line', () => {
+  assert.strictEqual(describeEntry({ method: 'screen.list', params: { count: 2 } }), 'List displays: 2');
+  assert.strictEqual(describeEntry({ method: 'screen.list', params: {} }), 'List displays');
+});
+
+// --- 0.5.3: version-free portable name + tray left-click setting -------------
+
+test('0.5.3 rename: the updater expects the version-free asset name for every release', () => {
+  assert.strictEqual(EXE_ASSET_NAME, 'Muse-Portable.exe');
+  assert.strictEqual(exeAssetName(), 'Muse-Portable.exe');
+  assert.strictEqual(exeAssetName('9.9.9'), 'Muse-Portable.exe', 'no version interpolation remains');
+  // A release whose exe asset still carries a versioned name is NOT
+  // an offer to a 0.5.3 updater — the constant name is the contract.
+  const versioned = {
+    tag_name: 'v9.9.9',
+    assets: [
+      { name: 'Muse-Portable-9.9.9.exe', browser_download_url: 'https://example.test/Muse-Portable-9.9.9.exe' },
+      { name: 'SHA256SUMS.txt', browser_download_url: 'https://example.test/SHA256SUMS.txt' },
+    ],
+  };
+  const parsed = parseLatestRelease(versioned, '0.5.2');
+  assert.strictEqual(parsed.offer, null);
+  assert.strictEqual(parsed.reason, 'missing-exe-asset');
+});
+
+test('0.5.3 tray: left-click dispatch honors the current setting value', () => {
+  assert.strictEqual(trayLeftClickTarget('settings'), 'settings');
+  assert.strictEqual(trayLeftClickTarget('window'), 'window');
+  assert.strictEqual(trayLeftClickTarget(undefined), 'window', 'unset reads as the default');
+  assert.strictEqual(trayLeftClickTarget('bogus'), 'window', 'unknown values fall back to window');
+  assert.strictEqual(normalizeTrayLeftClick('settings'), 'settings');
+  assert.strictEqual(normalizeTrayLeftClick('window'), 'window');
+  assert.strictEqual(normalizeTrayLeftClick('bogus'), 'window');
+});
+
+function settingsTmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'muse-settings-'));
+}
+
+test('0.5.3 tray: trayLeftClick defaults to window — fresh, and for a pre-existing file without the key', () => {
+  assert.strictEqual(SETTINGS_DEFAULTS.trayLeftClick, 'window');
+  const freshDir = settingsTmpDir();
+  try {
+    const fresh = ensureSettings(freshDir);
+    assert.strictEqual(fresh.created, true);
+    assert.strictEqual(fresh.values.trayLeftClick, 'window');
+  } finally {
+    fs.rmSync(freshDir, { recursive: true, force: true });
+  }
+  const legacyDir = settingsTmpDir();
+  try {
+    // A settings.json written by an older build: no trayLeftClick key.
+    fs.writeFileSync(
+      path.join(legacyDir, 'settings.json'),
+      JSON.stringify({ assistantFolder: 'C:\\Users\\you\\Muse', maxStorageGB: 10 }),
+    );
+    const upgraded = ensureSettings(legacyDir);
+    assert.strictEqual(upgraded.values.trayLeftClick, 'window');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(legacyDir, 'settings.json'), 'utf8'));
+    assert.strictEqual(onDisk.trayLeftClick, 'window', 'the merged default is persisted');
+  } finally {
+    fs.rmSync(legacyDir, { recursive: true, force: true });
+  }
+});
+
+test('0.5.3 tray: the setting round-trips through settings.json; a bogus value normalizes', () => {
+  const dir = settingsTmpDir();
+  try {
+    const first = ensureSettings(dir);
+    saveSettings(dir, { ...first.values, trayLeftClick: 'settings' });
+    assert.strictEqual(ensureSettings(dir).values.trayLeftClick, 'settings');
+    saveSettings(dir, { ...first.values, trayLeftClick: 'sideways' });
+    assert.strictEqual(ensureSettings(dir).values.trayLeftClick, 'window');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('0.5.3 tray: the settings-window wiring (handler, preload, page, renderer)', () => {
+  const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
+  const handlers = read('src/settingsHandlers.js');
+  assert.ok(handlers.includes("ipcMain.handle('settings:set-tray-left-click'"), 'the IPC handler exists');
+  assert.ok(handlers.includes('trayLeftClick:'), 'the state payload carries trayLeftClick');
+  const preload = read('src/settings/preload.js');
+  assert.ok(
+    preload.includes("setTrayLeftClick: (action) => ipcRenderer.invoke('settings:set-tray-left-click', action)"),
+    'the preload exposes setTrayLeftClick on the same channel',
+  );
+  const page = read('src/settings/index.html');
+  assert.ok(page.includes('id="trayLeftClickSelect"'), 'the page has the control');
+  assert.ok(page.includes('Tray left-click'), 'the row label');
+  assert.ok(page.includes('<option value="window">Show/hide window</option>'), 'the window option');
+  assert.ok(page.includes('<option value="settings">Open settings</option>'), 'the settings option');
+  const renderer = read('src/settings/renderer.js');
+  assert.ok(
+    renderer.includes('window.museSettings.setTrayLeftClick(event.target.value)'),
+    'the renderer saves through the bridge',
+  );
+  assert.ok(
+    renderer.includes("$('trayLeftClickSelect').value = state.trayLeftClick"),
+    'render() reflects the saved value into the control',
+  );
 });
 
 // ---------------------------------------------------------------------------
