@@ -9,7 +9,7 @@ const WindowState = require('./windowState');
 
 const MUSE_URL = 'https://muse.ai';
 
-function createMainWindow(userDataPath, { show = true } = {}) {
+function createMainWindow(userDataPath, { show = true, url = MUSE_URL } = {}) {
   const state = new WindowState(path.join(userDataPath, 'window-state.json'));
   state.sanitizePosition(screen.getAllDisplays().map((d) => d.bounds));
 
@@ -51,7 +51,10 @@ function createMainWindow(userDataPath, { show = true } = {}) {
     },
   }));
 
-  win.loadURL(MUSE_URL);
+  // The window loads muse.ai at the root by default; a Jump List
+  // section task cold start (0.5.6) passes its section URL so the
+  // window is created directly at the destination.
+  win.loadURL(url);
   return win;
 }
 

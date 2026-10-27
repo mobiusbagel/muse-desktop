@@ -58,6 +58,16 @@
 // updater's exe asset is the constant Muse-Portable.exe) and the
 // tray left-click setting (dispatch, 'window' default incl. legacy
 // settings files, settings.json round-trip, settings-window wiring).
+// 0.5.6 coverage: the Jump List grows to nine tasks — the six new
+// ones jump into Muse's sidebar: section routes (Ideas/Goals/
+// Library/Feed navigate the main window via museNav.js — cold start
+// creates the window at the URL, a running window is navigated,
+// an already-loading destination is not re-navigated) and the two
+// route-less overlays (Search = Ctrl+K, Settings = Ctrl+, sent as
+// input events once the page loads; a still-loading page delays
+// the chord until did-finish-load, and the timeout path sends
+// nothing and logs). --task=muse-settings must not disturb
+// --task=settings (the app's own settings window).
 // Run: npm test
 'use strict';
 
@@ -103,7 +113,17 @@ const {
   REMOVED_SETTINGS_KEYS,
 } = require('../src/settings');
 const { buildTrayMenuTemplate } = require('../src/tray');
-const { TASK_DEFINITIONS, buildUserTasks, parseTaskArg, routeTaskArg } = require('../src/jumpList');
+const { TASK_DEFINITIONS, TASK_ACTIONS, buildUserTasks, parseTaskArg, routeTaskArg } = require('../src/jumpList');
+const {
+  SECTION_URLS,
+  sectionUrlForTask,
+  navigateWindowToSection,
+  CHORDS,
+  chordForTask,
+  chordInputEvents,
+  CHORD_LOAD_TIMEOUT_MS,
+  sendChordWhenReady,
+} = require('../src/museNav');
 const { restartApp, exeCommandLine } = require('../src/restartApp');
 const {
   getStorageInfo,
@@ -2675,17 +2695,17 @@ test('0.5.4 wiring: menu rebuild triggers and the shared settings path', () => {
   assert.ok(handlers.includes('context.refreshTrayMenu()'), 'the shared path refreshes the tray menu after a toggle');
 });
 
-test('0.5.4 jump list: exactly three task definitions — titles, --task args, exe icon; no check-updates', () => {
+test('0.5.4 jump list: the original three definitions lead the list — titles, --task args, exe icon; no check-updates', () => {
   const exe = 'C:\\Tools\\Muse\\Muse-Portable.exe';
   const tasks = buildUserTasks(exe);
-  assert.strictEqual(TASK_DEFINITIONS.length, 3);
-  assert.strictEqual(tasks.length, 3);
+  // 0.5.6 appended the six Muse section tasks after these three;
+  // the original trio's order, titles and args are unchanged.
   assert.deepStrictEqual(
-    tasks.map((t) => t.title),
+    tasks.slice(0, 3).map((t) => t.title),
     ['Open Assistant Folder', 'Assistant Folder & Storage…', 'Bridge Activity…'],
   );
   assert.deepStrictEqual(
-    tasks.map((t) => t.arguments),
+    tasks.slice(0, 3).map((t) => t.arguments),
     ['--task=open-folder', '--task=settings', '--task=activity'],
   );
   // Update-checking belongs to the running app, not the launcher.
@@ -2728,7 +2748,7 @@ test('0.5.4 jump list: main registers the tasks and routes cold start + second-i
   assert.ok(main.includes('app.setUserTasks(buildUserTasks(exePath))'), 'tasks registered at startup');
   assert.ok(main.includes('process.env.PORTABLE_EXECUTABLE_FILE || process.execPath'), 'icon/program = the portable exe when there is one');
   assert.ok(main.includes('const startupTask = parseTaskArg(process.argv);'), 'cold start parses its own argv');
-  assert.ok(main.includes('{ show: !startupTask }'), 'a task launch creates the main window hidden');
+  assert.ok(main.includes('show: !startupTask || !!startupSectionUrl'), 'a non-section task launch creates the main window hidden; a section task shows it');
   assert.ok(main.includes('if (startupTask) routeTaskArg(process.argv, taskActions);'), 'cold start performs the task after startup');
   assert.ok(main.includes('if (!routeTaskArg(argv, taskActions)) showWindow();'), 'second-instance routes its argv through the same router');
 });
@@ -2781,6 +2801,246 @@ test('0.5.4 restart: the exe WMI command quotes the path; main wires Restart thr
   assert.ok(main.includes('portableExePath: process.env.PORTABLE_EXECUTABLE_FILE || null'), 'portable runs target PORTABLE_EXECUTABLE_FILE');
   assert.ok(main.includes('launchViaWmi: defaultLaunchExeViaWmi'), 'the WMI launcher is the default');
   assert.ok(main.includes('onRestart: restartMuse'), 'the tray Restart item is wired');
+});
+
+// --- 0.5.6: Jump List Muse section shortcuts --------------------------------
+
+test('0.5.6 jump list: exactly nine tasks — the original three, then Search, Ideas, Goals, Library, Feed, Settings', () => {
+  const exe = 'C:\\Tools\\Muse\\Muse-Portable.exe';
+  const tasks = buildUserTasks(exe);
+  assert.strictEqual(TASK_DEFINITIONS.length, 9);
+  assert.strictEqual(tasks.length, 9);
+  assert.deepStrictEqual(
+    TASK_DEFINITIONS.map((d) => [d.task, d.title, d.arguments]),
+    [
+      ['open-folder', 'Open Assistant Folder', '--task=open-folder'],
+      ['settings', 'Assistant Folder & Storage…', '--task=settings'],
+      ['activity', 'Bridge Activity…', '--task=activity'],
+      ['search', 'Search', '--task=search'],
+      ['ideas', 'Ideas', '--task=ideas'],
+      ['goals', 'Goals', '--task=goals'],
+      ['library', 'Library', '--task=library'],
+      ['feed', 'Feed', '--task=feed'],
+      ['muse-settings', 'Settings', '--task=muse-settings'],
+    ],
+  );
+  for (const t of tasks) {
+    assert.strictEqual(t.program, exe);
+    assert.strictEqual(t.iconPath, exe, 'every task borrows the exe icon');
+    assert.strictEqual(t.iconIndex, 0);
+  }
+});
+
+test('0.5.6 jump list: the router maps all six new tasks; muse-settings is not the app settings window', () => {
+  const seen = [];
+  const actions = {
+    onOpenSettings: (task) => seen.push(['settings-window', task]),
+    onOpenAssistantFolder: (task) => seen.push(['folder', task]),
+    onOpenActivity: (task) => seen.push(['activity', task]),
+    onOpenMuseSection: (task) => seen.push(['section', task]),
+    onMuseChord: (task) => seen.push(['chord', task]),
+  };
+  const exe = 'C:\\Tools\\Muse\\Muse-Portable.exe';
+  assert.strictEqual(routeTaskArg([exe, '--task=search'], actions), 'search');
+  assert.strictEqual(routeTaskArg([exe, '--task=ideas'], actions), 'ideas');
+  assert.strictEqual(routeTaskArg([exe, '--task=goals'], actions), 'goals');
+  assert.strictEqual(routeTaskArg([exe, '--task=library'], actions), 'library');
+  assert.strictEqual(routeTaskArg([exe, '--task=feed'], actions), 'feed');
+  assert.strictEqual(routeTaskArg([exe, '--task=muse-settings'], actions), 'muse-settings');
+  assert.strictEqual(routeTaskArg([exe, '--task=settings'], actions), 'settings');
+  assert.deepStrictEqual(seen, [
+    ['chord', 'search'],
+    ['section', 'ideas'],
+    ['section', 'goals'],
+    ['section', 'library'],
+    ['section', 'feed'],
+    ['chord', 'muse-settings'],
+    ['settings-window', 'settings'],
+  ]);
+  // The arg split is the whole point of muse-settings: Muse's own
+  // Settings overlay rides the chord action, while --task=settings
+  // still opens the app's Assistant Folder & Storage window.
+  assert.strictEqual(TASK_ACTIONS['muse-settings'], 'onMuseChord');
+  assert.strictEqual(TASK_ACTIONS.settings, 'onOpenSettings');
+  assert.strictEqual(TASK_ACTIONS.search, 'onMuseChord');
+});
+
+test('0.5.6 muse sections: the URL map is exact and only the four routed sections have one', () => {
+  assert.deepStrictEqual(SECTION_URLS, {
+    ideas: 'https://muse.ai/ideas',
+    goals: 'https://muse.ai/goals',
+    library: 'https://muse.ai/library',
+    feed: 'https://muse.ai/feed',
+  });
+  assert.strictEqual(sectionUrlForTask('ideas'), 'https://muse.ai/ideas');
+  assert.strictEqual(sectionUrlForTask('goals'), 'https://muse.ai/goals');
+  assert.strictEqual(sectionUrlForTask('library'), 'https://muse.ai/library');
+  assert.strictEqual(sectionUrlForTask('feed'), 'https://muse.ai/feed');
+  for (const task of ['search', 'muse-settings', 'settings', 'open-folder', 'activity', 'check-updates', null, undefined]) {
+    assert.strictEqual(sectionUrlForTask(task), null, `no section URL for ${task}`);
+  }
+});
+
+test('0.5.6 muse sections: a running window is navigated to the exact section URL', () => {
+  const navs = [];
+  const win = {
+    webContents: { getURL: () => 'https://muse.ai/thread/abc' },
+    loadURL: (u) => navs.push(u),
+  };
+  assert.strictEqual(navigateWindowToSection(win, 'goals', null), true);
+  assert.deepStrictEqual(navs, ['https://muse.ai/goals']);
+  assert.strictEqual(navigateWindowToSection(win, 'feed', null), true);
+  assert.deepStrictEqual(navs, ['https://muse.ai/goals', 'https://muse.ai/feed']);
+});
+
+test('0.5.6 muse sections: no navigation when the window is already there or already loading it', () => {
+  const navs = [];
+  const atFeed = {
+    webContents: { getURL: () => 'https://muse.ai/feed' },
+    loadURL: (u) => navs.push(u),
+  };
+  assert.strictEqual(navigateWindowToSection(atFeed, 'feed', null), false, 'already on the section');
+  const coldStart = {
+    webContents: { getURL: () => '' },
+    loadURL: (u) => navs.push(u),
+  };
+  assert.strictEqual(
+    navigateWindowToSection(coldStart, 'ideas', 'https://muse.ai/ideas'),
+    false,
+    'the cold-start window was created at the URL — do not restart its load',
+  );
+  assert.strictEqual(navigateWindowToSection(coldStart, 'search', null), false, 'chord tasks never navigate');
+  assert.strictEqual(navigateWindowToSection(null, 'ideas', null), false, 'no window, no navigation');
+  assert.deepStrictEqual(navs, []);
+});
+
+test('0.5.6 muse sections: cold start creates the window at the section URL (wiring contract)', () => {
+  const mainWindowSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'mainWindow.js'), 'utf8');
+  assert.ok(mainWindowSrc.includes('{ show = true, url = MUSE_URL }'), 'the factory accepts an initial URL, defaulting to the muse.ai root');
+  assert.ok(mainWindowSrc.includes('win.loadURL(url);'), 'the window loads the requested URL');
+  const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert.ok(main.includes('const startupSectionUrl = startupTask ? sectionUrlForTask(startupTask) : null;'), 'cold start resolves the section URL from the task');
+  assert.ok(main.includes('url: startupSectionUrl || undefined'), 'the window is created directly at the section URL');
+  assert.ok(main.includes('coldStartSectionUrl = startupSectionUrl;'), 'the in-flight cold-start load is recorded for the router');
+  assert.ok(main.includes('onOpenMuseSection: openMuseSection'), 'the section action is wired into the task actions');
+  assert.ok(main.includes('navigateWindowToSection(mainWindow, task, alreadyRequested)'), 'the section action navigates through museNav');
+});
+
+test('0.5.6 muse chords: the chord definitions and input-event sequences are exact', () => {
+  assert.deepStrictEqual(CHORDS, {
+    search: { keyCode: 'K', modifiers: ['control'] },
+    'muse-settings': { keyCode: ',', modifiers: ['control'] },
+  });
+  assert.deepStrictEqual(chordInputEvents(chordForTask('search')), [
+    { type: 'keyDown', keyCode: 'K', modifiers: ['control'] },
+    { type: 'keyUp', keyCode: 'K', modifiers: ['control'] },
+  ]);
+  assert.deepStrictEqual(chordInputEvents(chordForTask('muse-settings')), [
+    { type: 'keyDown', keyCode: ',', modifiers: ['control'] },
+    { type: 'keyUp', keyCode: ',', modifiers: ['control'] },
+  ]);
+  assert.strictEqual(chordForTask('feed'), null, 'section tasks have no chord');
+  assert.strictEqual(chordForTask('settings'), null, 'the app settings window has no chord');
+  assert.strictEqual(CHORD_LOAD_TIMEOUT_MS, 15_000);
+});
+
+// A fake webContents + fake timers for the chord sender: the load
+// listener is captured, the timeout callback is captured, and
+// nothing fires unless the test fires it.
+function fakeChordRig({ loading }) {
+  const rig = {
+    sent: [],
+    logs: [],
+    clearedTimers: [],
+    removedListeners: [],
+    loadListener: null,
+    timeoutCallback: null,
+    timeoutMs: null,
+  };
+  rig.webContents = {
+    isLoading: () => loading,
+    once: (event, cb) => {
+      assert.strictEqual(event, 'did-finish-load');
+      rig.loadListener = cb;
+    },
+    removeListener: (event, cb) => rig.removedListeners.push([event, cb === rig.loadListener]),
+    sendInputEvent: (event) => rig.sent.push(event),
+  };
+  rig.timers = {
+    setTimeoutFn: (cb, ms) => {
+      rig.timeoutCallback = cb;
+      rig.timeoutMs = ms;
+      return 'timer-1';
+    },
+    clearTimeoutFn: (id) => rig.clearedTimers.push(id),
+  };
+  rig.log = (message) => rig.logs.push(message);
+  return rig;
+}
+
+test('0.5.6 muse chords: a loaded page gets the chord immediately', async () => {
+  const rig = fakeChordRig({ loading: false });
+  const sent = await sendChordWhenReady({
+    webContents: rig.webContents,
+    chord: chordForTask('search'),
+    log: rig.log,
+    ...rig.timers,
+  });
+  assert.strictEqual(sent, true);
+  assert.deepStrictEqual(rig.sent, [
+    { type: 'keyDown', keyCode: 'K', modifiers: ['control'] },
+    { type: 'keyUp', keyCode: 'K', modifiers: ['control'] },
+  ]);
+  assert.strictEqual(rig.loadListener, null, 'no load wait on a loaded page');
+  assert.deepStrictEqual(rig.logs, []);
+});
+
+test('0.5.6 muse chords: a still-loading page delays the chord until did-finish-load', async () => {
+  const rig = fakeChordRig({ loading: true });
+  const pending = sendChordWhenReady({
+    webContents: rig.webContents,
+    chord: chordForTask('muse-settings'),
+    log: rig.log,
+    ...rig.timers,
+  });
+  assert.deepStrictEqual(rig.sent, [], 'nothing fires while the page is loading');
+  assert.strictEqual(rig.timeoutMs, CHORD_LOAD_TIMEOUT_MS, 'the wait is timeout-guarded');
+  rig.loadListener();
+  const sent = await pending;
+  assert.strictEqual(sent, true);
+  assert.deepStrictEqual(rig.sent, [
+    { type: 'keyDown', keyCode: ',', modifiers: ['control'] },
+    { type: 'keyUp', keyCode: ',', modifiers: ['control'] },
+  ]);
+  assert.deepStrictEqual(rig.clearedTimers, ['timer-1'], 'the timeout is cancelled once the load lands');
+  assert.deepStrictEqual(rig.logs, []);
+});
+
+test('0.5.6 muse chords: the timeout path sends nothing and logs', async () => {
+  const rig = fakeChordRig({ loading: true });
+  const pending = sendChordWhenReady({
+    webContents: rig.webContents,
+    chord: chordForTask('search'),
+    timeoutMs: 5_000,
+    log: rig.log,
+    ...rig.timers,
+  });
+  assert.strictEqual(rig.timeoutMs, 5_000);
+  rig.timeoutCallback();
+  const sent = await pending;
+  assert.strictEqual(sent, false);
+  assert.deepStrictEqual(rig.sent, [], 'a chord never fires blind into an unloaded page');
+  assert.strictEqual(rig.logs.length, 1, 'exactly one log line');
+  assert.ok(rig.logs[0].includes('skipped'), 'the log line says the chord was skipped');
+  assert.deepStrictEqual(rig.removedListeners, [['did-finish-load', true]], 'the one-shot load listener is cleaned up');
+});
+
+test('0.5.6 muse chords: main wires the chord action through sendChordWhenReady (wiring contract)', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert.ok(main.includes('onMuseChord: openMuseChord'), 'the chord action is wired into the task actions');
+  assert.ok(main.includes('sendChordWhenReady({'), 'the chord goes through the load-guarded sender');
+  assert.ok(main.includes('const chord = chordForTask(task);'), 'the chord resolves from the task name');
+  assert.ok(!main.includes('executeJavaScript'), 'no script injection into the muse.ai page');
 });
 
 // ---------------------------------------------------------------------------

@@ -21,10 +21,14 @@ on your PC, and a plain-language audit log of everything that happened.
   **Checking…** → **Restart to Update to \<version\>…**),
   **Restart Muse**, and Quit.
 - **Jump List launcher:** right-clicking the app's taskbar icon offers
-  three destinations — **Open Assistant Folder**,
-  **Assistant Folder & Storage…**, and **Bridge Activity…** — which
-  work cold (the app starts straight at the destination) and route to
-  the running instance when the app is already open. Nothing is
+  nine destinations — **Open Assistant Folder**,
+  **Assistant Folder & Storage…**, and **Bridge Activity…**, plus
+  jumps into Muse itself: **Ideas**, **Goals**, **Library** and
+  **Feed** navigate the main window to those sidebar sections, and
+  **Search** / **Settings** open Muse's overlays via their global
+  chords (Ctrl+K / Ctrl+,) once the page loads — which work cold
+  (the app starts straight at the destination) and route to the
+  running instance when the app is already open. Nothing is
   duplicated between the tray menu and the Jump List.
 - **Global hotkey:** `Ctrl+Alt+M` shows/hides the window from anywhere.
   Single instance: launching again just focuses the running app.

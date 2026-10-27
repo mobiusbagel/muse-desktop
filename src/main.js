@@ -10,6 +10,7 @@ const path = require('path');
 const { createMainWindow } = require('./mainWindow');
 const { createTray } = require('./tray');
 const { buildUserTasks, parseTaskArg, routeTaskArg } = require('./jumpList');
+const { sectionUrlForTask, navigateWindowToSection, chordForTask, sendChordWhenReady } = require('./museNav');
 const { restartApp, defaultLaunchExeViaWmi } = require('./restartApp');
 const { startBridgeSet, BRIDGE_PORT } = require('./bridge');
 const { getBridgeStatus } = require('./bridgeNetwork');
@@ -49,6 +50,11 @@ let bridgeSet = null;
 let bridgeDeps = null;
 let updater = null;
 let isQuitting = false;
+// The section URL the main window was created at on a Jump List
+// section-task cold start (0.5.6), consumed by openMuseSection so
+// the router does not navigate a window that is already loading
+// its destination.
+let coldStartSectionUrl = null;
 
 // The bridge status for the settings window, computed fresh from the
 // live setting + current interfaces (pure logic in bridgeNetwork.js).
@@ -227,6 +233,37 @@ function restartMuse() {
   console.log(`[restart] next instance launched via ${via}`);
 }
 
+// A Jump List Muse section task (0.5.6: Ideas/Goals/Library/
+// Feed): the main window is the destination. Show + focus it, then
+// navigate — unless this is the cold start that created the window
+// directly at the section URL, in which case it is already loading
+// the right page and a second navigation would only restart it.
+function openMuseSection(task) {
+  const alreadyRequested = coldStartSectionUrl;
+  coldStartSectionUrl = null;
+  showWindow();
+  navigateWindowToSection(mainWindow, task, alreadyRequested);
+}
+
+// A Jump List Muse overlay task (0.5.6: Search / Settings): the
+// overlays have no URL — they open with Muse's own global chords
+// (Ctrl+K / Ctrl+,). Show + focus the window and send the chord as
+// input events once the page has loaded; sendChordWhenReady skips
+// (and logs) rather than firing blind if the load never finishes.
+// No navigation: the chords are app-global in Muse and land on
+// whatever muse.ai page is showing.
+function openMuseChord(task) {
+  const chord = chordForTask(task);
+  if (!chord) return;
+  showWindow();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  sendChordWhenReady({
+    webContents: mainWindow.webContents,
+    chord,
+    log: (message) => console.log(message),
+  }).catch((err) => console.error('[muse-nav] chord failed:', err.message));
+}
+
 // The Jump List tasks' destination callbacks (all hoisted
 // function declarations in this module). Since 0.5.4's split the
 // tray menu carries none of these — destinations are launcher-only.
@@ -234,6 +271,8 @@ const taskActions = {
   onOpenSettings: openSettingsWindow,
   onOpenAssistantFolder: openAssistantFolder,
   onOpenActivity: openActivityWindow,
+  onOpenMuseSection: openMuseSection,
+  onMuseChord: openMuseChord,
 };
 
 function wireWindow(win) {
@@ -491,9 +530,20 @@ if (!gotSingleInstanceLock) {
     // A cold launch carrying a Jump List task (--task=…) starts
     // tray-resident: the main window is created hidden and only
     // the task's own surface appears (settings/activity windows;
-    // open-folder shows nothing of its own).
+    // open-folder shows nothing of its own). The exception is a
+    // Muse section task (0.5.6): there the main window IS the
+    // destination, so it is created shown, directly at the
+    // section URL, and openMuseSection (routed below) leaves the
+    // in-flight load alone via coldStartSectionUrl. The overlay
+    // (chord) tasks keep the hidden start — their action shows
+    // the window itself.
     const startupTask = parseTaskArg(process.argv);
-    mainWindow = createMainWindow(app.getPath('userData'), { show: !startupTask });
+    const startupSectionUrl = startupTask ? sectionUrlForTask(startupTask) : null;
+    coldStartSectionUrl = startupSectionUrl;
+    mainWindow = createMainWindow(app.getPath('userData'), {
+      show: !startupTask || !!startupSectionUrl,
+      url: startupSectionUrl || undefined,
+    });
     wireWindow(mainWindow);
 
     trayHandle = createTray({
@@ -506,7 +556,7 @@ if (!gotSingleInstanceLock) {
       getMenuState: trayMenuState,
     });
 
-    // Jump List tasks (Windows): the three destination commands
+    // Jump List tasks (Windows): the nine destination commands
     // ride the app icon's taskbar menu; each launches with
     // --task=<name>, routed above on cold start and via
     // second-instance afterwards. The tasks borrow the running
