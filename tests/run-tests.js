@@ -100,9 +100,9 @@ const {
   ensureSettings,
   saveSettings,
   DEFAULT_SETTINGS: SETTINGS_DEFAULTS,
-  normalizeTrayLeftClick,
+  REMOVED_SETTINGS_KEYS,
 } = require('../src/settings');
-const { trayLeftClickTarget, buildTrayMenuTemplate } = require('../src/tray');
+const { buildTrayMenuTemplate } = require('../src/tray');
 const { TASK_DEFINITIONS, buildUserTasks, parseTaskArg, routeTaskArg } = require('../src/jumpList');
 const { restartApp, exeCommandLine } = require('../src/restartApp');
 const {
@@ -2458,7 +2458,7 @@ test('0.5.3 activity: list-displays describe line', () => {
   assert.strictEqual(describeEntry({ method: 'screen.list', params: {} }), 'List displays');
 });
 
-// --- 0.5.3: version-free portable name + tray left-click setting -------------
+// --- 0.5.3: version-free portable name ---------------------------------------
 
 test('0.5.3 rename: the updater expects the version-free asset name for every release', () => {
   assert.strictEqual(EXE_ASSET_NAME, 'Muse-Portable.exe');
@@ -2478,83 +2478,76 @@ test('0.5.3 rename: the updater expects the version-free asset name for every re
   assert.strictEqual(parsed.reason, 'missing-exe-asset');
 });
 
-test('0.5.3 tray: left-click dispatch honors the current setting value', () => {
-  assert.strictEqual(trayLeftClickTarget('settings'), 'settings');
-  assert.strictEqual(trayLeftClickTarget('window'), 'window');
-  assert.strictEqual(trayLeftClickTarget(undefined), 'window', 'unset reads as the default');
-  assert.strictEqual(trayLeftClickTarget('bogus'), 'window', 'unknown values fall back to window');
-  assert.strictEqual(normalizeTrayLeftClick('settings'), 'settings');
-  assert.strictEqual(normalizeTrayLeftClick('window'), 'window');
-  assert.strictEqual(normalizeTrayLeftClick('bogus'), 'window');
-});
-
 function settingsTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'muse-settings-'));
 }
 
-test('0.5.3 tray: trayLeftClick defaults to window — fresh, and for a pre-existing file without the key', () => {
-  assert.strictEqual(SETTINGS_DEFAULTS.trayLeftClick, 'window');
-  const freshDir = settingsTmpDir();
-  try {
-    const fresh = ensureSettings(freshDir);
-    assert.strictEqual(fresh.created, true);
-    assert.strictEqual(fresh.values.trayLeftClick, 'window');
-  } finally {
-    fs.rmSync(freshDir, { recursive: true, force: true });
-  }
-  const legacyDir = settingsTmpDir();
-  try {
-    // A settings.json written by an older build: no trayLeftClick key.
-    fs.writeFileSync(
-      path.join(legacyDir, 'settings.json'),
-      JSON.stringify({ assistantFolder: 'C:\\Users\\you\\Muse', maxStorageGB: 10 }),
-    );
-    const upgraded = ensureSettings(legacyDir);
-    assert.strictEqual(upgraded.values.trayLeftClick, 'window');
-    const onDisk = JSON.parse(fs.readFileSync(path.join(legacyDir, 'settings.json'), 'utf8'));
-    assert.strictEqual(onDisk.trayLeftClick, 'window', 'the merged default is persisted');
-  } finally {
-    fs.rmSync(legacyDir, { recursive: true, force: true });
-  }
-});
+// --- 0.5.5: tray left-click setting removed -----------------------------------
 
-test('0.5.3 tray: the setting round-trips through settings.json; a bogus value normalizes', () => {
+test('0.5.5 tray: fresh settings carry no trayLeftClick key anywhere', () => {
+  assert.ok(!('trayLeftClick' in SETTINGS_DEFAULTS), 'the default is gone');
+  assert.deepStrictEqual(REMOVED_SETTINGS_KEYS, ['trayLeftClick'], 'the key is on the removed list');
   const dir = settingsTmpDir();
   try {
-    const first = ensureSettings(dir);
-    saveSettings(dir, { ...first.values, trayLeftClick: 'settings' });
-    assert.strictEqual(ensureSettings(dir).values.trayLeftClick, 'settings');
-    saveSettings(dir, { ...first.values, trayLeftClick: 'sideways' });
-    assert.strictEqual(ensureSettings(dir).values.trayLeftClick, 'window');
+    const fresh = ensureSettings(dir);
+    assert.strictEqual(fresh.created, true);
+    assert.ok(!('trayLeftClick' in fresh.values), 'loaded values have no trayLeftClick');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+    assert.ok(!('trayLeftClick' in onDisk), 'the written file has no trayLeftClick');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('0.5.3 tray: the settings-window wiring (handler, preload, page, renderer)', () => {
+test('0.5.5 tray: a legacy trayLeftClick in settings.json loads cleanly and is dropped on save', () => {
+  const dir = settingsTmpDir();
+  try {
+    // A settings.json written by 0.5.3/0.5.4 with the setting flipped
+    // to 'settings' — the value that used to reroute the tray click.
+    fs.writeFileSync(
+      path.join(dir, 'settings.json'),
+      JSON.stringify({
+        assistantFolder: 'C:\\Users\\you\\Muse',
+        maxStorageGB: 10,
+        trayLeftClick: 'settings',
+      }),
+    );
+    const loaded = ensureSettings(dir);
+    assert.ok(!('trayLeftClick' in loaded.values), 'the removed key is not carried in the live values');
+    const afterLoad = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+    assert.ok(!('trayLeftClick' in afterLoad), 'the key is dropped from the file at load');
+    // And a later save round-trip (what every settings change does)
+    // cannot resurrect it.
+    saveSettings(dir, loaded.values);
+    assert.ok(!('trayLeftClick' in ensureSettings(dir).values), 'still absent after a save round-trip');
+    const afterSave = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+    assert.ok(!('trayLeftClick' in afterSave), 'still absent on disk after a save round-trip');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('0.5.5 tray: the setting surface is gone and the click binds the toggle directly', () => {
   const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
   const handlers = read('src/settingsHandlers.js');
-  assert.ok(handlers.includes("ipcMain.handle('settings:set-tray-left-click'"), 'the IPC handler exists');
-  assert.ok(handlers.includes('trayLeftClick:'), 'the state payload carries trayLeftClick');
+  assert.ok(!handlers.includes('settings:set-tray-left-click'), 'the IPC handler is removed');
+  assert.ok(!handlers.includes('trayLeftClick'), 'the state payload carries no trayLeftClick');
   const preload = read('src/settings/preload.js');
-  assert.ok(
-    preload.includes("setTrayLeftClick: (action) => ipcRenderer.invoke('settings:set-tray-left-click', action)"),
-    'the preload exposes setTrayLeftClick on the same channel',
-  );
+  assert.ok(!preload.includes('setTrayLeftClick'), 'the preload bridge is removed');
   const page = read('src/settings/index.html');
-  assert.ok(page.includes('id="trayLeftClickSelect"'), 'the page has the control');
-  assert.ok(page.includes('Tray left-click'), 'the row label');
-  assert.ok(page.includes('<option value="window">Show/hide window</option>'), 'the window option');
-  assert.ok(page.includes('<option value="settings">Open settings</option>'), 'the settings option');
+  assert.ok(!page.includes('trayLeftClickSelect'), 'the page control is removed');
+  assert.ok(!page.includes('Tray left-click'), 'the row label is removed');
   const renderer = read('src/settings/renderer.js');
+  assert.ok(!renderer.includes('trayLeftClick'), 'the renderer has no tray-left-click wiring');
+  const tray = read('src/tray.js');
+  assert.ok(!tray.includes('trayLeftClickTarget'), 'the dispatch helper is removed');
+  assert.ok(!tray.includes('getTrayLeftClick'), 'the tray reads no setting at click time');
   assert.ok(
-    renderer.includes('window.museSettings.setTrayLeftClick(event.target.value)'),
-    'the renderer saves through the bridge',
+    tray.includes("tray.on('click', onToggle)"),
+    'left-click binds the window toggle directly — the pre-0.5.3 behavior',
   );
-  assert.ok(
-    renderer.includes("$('trayLeftClickSelect').value = state.trayLeftClick"),
-    'render() reflects the saved value into the control',
-  );
+  const main = read('src/main.js');
+  assert.ok(!main.includes('getTrayLeftClick'), 'main passes no tray-left-click dep');
 });
 
 // --- 0.5.4: tray menu v2 + Jump List tasks + Restart Muse -------------------

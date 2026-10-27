@@ -17,18 +17,15 @@ const DEFAULT_SETTINGS = {
   // 0.5.0: gates the updater's once-after-launch check only; a manual
   // "Check now" always runs.
   autoCheckUpdates: true,
-  // 0.5.3: what the tray icon's LEFT-click does — 'window' toggles the
-  // main window (the original behavior), 'settings' opens the
-  // settings window (the same action as the tray menu item).
-  trayLeftClick: 'window',
 };
 
-// The only trayLeftClick values with meaning; anything else (a
-// hand-edited settings.json, an older build's file) reads as the
-// default 'window'.
-function normalizeTrayLeftClick(value) {
-  return value === 'settings' ? 'settings' : 'window';
-}
+// Settings keys removed by later builds (0.5.5 removed
+// `trayLeftClick`, the 0.5.3 tray left-click behavior setting).
+// ensureSettings deletes them from the loaded values and marks the
+// file dirty, so the existing save flow rewrites settings.json
+// without them — a removed setting never rides along in the live
+// object and gets re-persisted by every later save.
+const REMOVED_SETTINGS_KEYS = ['trayLeftClick'];
 
 function saveSettings(userDataPath, values) {
   const file = path.join(userDataPath, 'settings.json');
@@ -49,6 +46,15 @@ function ensureSettings(userDataPath) {
     try {
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
       values = { ...DEFAULT_SETTINGS, ...parsed };
+      // Drop keys this build no longer knows (see
+      // REMOVED_SETTINGS_KEYS): the delete + dirty flag make the
+      // save below rewrite the file without them.
+      for (const key of REMOVED_SETTINGS_KEYS) {
+        if (key in values) {
+          delete values[key];
+          dirty = true;
+        }
+      }
       // Persist newly introduced defaults (e.g. bridgeRemoteAccess in
       // 0.3.0) so the file on disk reflects the full current schema.
       if (Object.keys(DEFAULT_SETTINGS).some((key) => !(key in parsed))) dirty = true;
@@ -60,11 +66,6 @@ function ensureSettings(userDataPath) {
     dirty = true;
     created = true;
   }
-
-  // Normalize the tray left-click action (0.5.3): an unrecognized
-  // value in the file falls back to 'window' rather than breaking
-  // the tray click.
-  values.trayLeftClick = normalizeTrayLeftClick(values.trayLeftClick);
 
   // Installer hand-off: the NSIS installer writes assistant-folder.txt into
   // userData with the assistant folder the user picked during setup. The
@@ -93,4 +94,4 @@ function ensureSettings(userDataPath) {
   return { values, file, created, fromInstaller };
 }
 
-module.exports = { ensureSettings, saveSettings, DEFAULT_SETTINGS, normalizeTrayLeftClick };
+module.exports = { ensureSettings, saveSettings, DEFAULT_SETTINGS, REMOVED_SETTINGS_KEYS };

@@ -1,9 +1,13 @@
-// System tray icon, its context menu, and the left-click dispatch.
+// System tray icon and its context menu.
 //
 // Design rule (0.5.4): the tray menu is the cockpit of the RUNNING
 // app — state + lifecycle only. Destinations (settings, the folder,
 // activity) live on the Windows Jump List instead (jumpList.js);
 // no item appears on both surfaces.
+//
+// A left-click on the icon toggles the main window — the original
+// behavior, unconditional since 0.5.5 (the 0.5.3 trayLeftClick
+// setting that could reroute it to the settings window is removed).
 //
 // The menu is built by a PURE template function from an app-state
 // snapshot, and createTray rebuilds it whenever main reports a
@@ -17,14 +21,6 @@
 const { Tray, Menu, nativeImage } = require('electron');
 const fs = require('fs');
 const path = require('path');
-
-// Pure dispatch for the tray icon's left-click (0.5.3): the current
-// trayLeftClick setting value in, the action out. Anything that is
-// not 'settings' is the default 'window' behavior. Dependency-free
-// so the suite can exercise it without Electron.
-function trayLeftClickTarget(value) {
-  return value === 'settings' ? 'settings' : 'window';
-}
 
 // The updates item is the state-driven one (0.5.4):
 //   checking        → disabled "Checking…"
@@ -57,9 +53,7 @@ function updatesMenuItem(state, actions) {
 //   pendingVersion,    // verified update's version when ready
 // }
 // actions = the click callbacks: onToggle, onToggleRemoteAccess,
-// onCheckForUpdates, onRestartUpdate, onRestart, onQuit. (The
-// settings opener is not a menu action — it is only the left-click
-// 'settings' dispatch below.)
+// onCheckForUpdates, onRestartUpdate, onRestart, onQuit.
 function buildTrayMenuTemplate(state, actions) {
   return [
     // Status first: two disabled lines, version and bridge state,
@@ -88,13 +82,11 @@ function buildTrayMenuTemplate(state, actions) {
 function createTray(deps) {
   const {
     onToggle,
-    onOpenSettings,
     onToggleRemoteAccess,
     onCheckForUpdates,
     onRestartUpdate,
     onRestart,
     onQuit,
-    getTrayLeftClick,
     getMenuState,
   } = deps;
   // Muse logo at 16 px with a 32 px @2x representation for high-DPI trays.
@@ -124,16 +116,11 @@ function createTray(deps) {
   }
   refreshMenu();
 
-  // Left-click dispatches on the CURRENT trayLeftClick setting,
-  // read at click time — changing it in the settings window takes
-  // effect immediately, no relaunch. 'window' (default) is the
-  // historical behavior: toggle the main window.
-  tray.on('click', () => {
-    const value = typeof getTrayLeftClick === 'function' ? getTrayLeftClick() : undefined;
-    if (trayLeftClickTarget(value) === 'settings') onOpenSettings();
-    else onToggle();
-  });
+  // Left-click toggles the main window — unconditionally, exactly
+  // the pre-0.5.3 behavior (0.5.5 removed the setting that could
+  // reroute it).
+  tray.on('click', onToggle);
   return { tray, refreshMenu };
 }
 
-module.exports = { createTray, trayLeftClickTarget, buildTrayMenuTemplate };
+module.exports = { createTray, buildTrayMenuTemplate };

@@ -10,7 +10,6 @@ contextBridge.exposeInMainWorld('museSettings', {
   setRemoteAccess: (enabled) => ipcRenderer.invoke('settings:set-remote-access', enabled),
   checkUpdates: () => ipcRenderer.invoke('settings:check-updates'),
   setAutoCheck: (enabled) => ipcRenderer.invoke('settings:set-auto-check', enabled),
-  setTrayLeftClick: (action) => ipcRenderer.invoke('settings:set-tray-left-click', action),
   pickFolder: () => ipcRenderer.invoke('settings:pick-folder'),
   precheckMove: (dest) => ipcRenderer.invoke('settings:precheck-move', dest),
   startMove: (dest) => ipcRenderer.invoke('settings:start-move', dest),

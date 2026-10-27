@@ -52,9 +52,9 @@ on your PC, and a plain-language audit log of everything that happened.
 - **Remote access (optional, off by default):** the bridge can also
   listen on your machine's Tailscale address — never a LAN or public
   address — with the same token and permission gates.
-- **Tray:** left-clicking the tray icon toggles the window by default;
-  a **Tray left-click** option in the settings window switches it to
-  opening the settings window instead. Takes effect immediately.
+- **Tray:** left-clicking the tray icon toggles the window. (A Tray
+  left-click setting existed in 0.5.3–0.5.4 and was removed in
+  0.5.5; the toggle is unconditional again.)
 - **In-app updates:** the app checks GitHub Releases, downloads the new
   portable build, and verifies it **twice** before offering it: the
   SHA-256 must match the release's `SHA256SUMS.txt`, **and** the

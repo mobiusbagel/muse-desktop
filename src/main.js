@@ -498,9 +498,6 @@ if (!gotSingleInstanceLock) {
 
     trayHandle = createTray({
       onToggle: toggleWindow,
-      onOpenSettings: openSettingsWindow,
-      // 0.5.3: the tray left-click reads the live setting per click.
-      getTrayLeftClick: () => context.settings.trayLeftClick,
       onToggleRemoteAccess: trayToggleRemoteAccess,
       onCheckForUpdates: trayCheckForUpdates,
       onRestartUpdate: trayRestartToUpdate,

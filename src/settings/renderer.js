@@ -56,7 +56,6 @@ function render() {
   $('updateStatusText').textContent = state.updateStatus || '';
   $('autoCheckToggle').checked = !!state.autoCheckUpdates;
   $('checkUpdatesBtn').disabled = state.updateStatus === 'Checking…';
-  $('trayLeftClickSelect').value = state.trayLeftClick === 'settings' ? 'settings' : 'window';
 }
 
 async function refresh() {
@@ -99,16 +98,6 @@ $('checkUpdatesBtn').addEventListener('click', async () => {
 $('autoCheckToggle').addEventListener('change', async (event) => {
   try {
     state = await window.museSettings.setAutoCheck(event.target.checked);
-    render();
-  } catch (err) {
-    setStatus(cleanErr(err), true);
-    await refresh();
-  }
-});
-
-$('trayLeftClickSelect').addEventListener('change', async (event) => {
-  try {
-    state = await window.museSettings.setTrayLeftClick(event.target.value);
     render();
   } catch (err) {
     setStatus(cleanErr(err), true);
