@@ -24,11 +24,15 @@ on your PC, and a plain-language audit log of everything that happened.
   and rollback on failure.
 - **Local Bridge:** an HTTP API on `127.0.0.1:47631` with token auth,
   exposing permission-gated tools: `fs.list`, `fs.read`, `fs.write`,
-  `fs.mkdir`, `app.launch`, `process.list`, `process.kill`, and
-  `shell.run`. Filesystem tools are scoped to the assistant folder
-  (plus folders you explicitly approve); every capability defaults to
-  "ask" in `permissions.json`, and `shell.run` can never be set to
-  always-allow — its prompt shows the exact command, every time.
+  `fs.mkdir`, `app.launch`, `process.list`, `process.kill`,
+  `shell.run`, and `screen.capture` (a PNG screenshot of one display,
+  downscaled to at most 2560 px wide by default). Filesystem tools are
+  scoped to the assistant folder (plus folders you explicitly approve);
+  every capability defaults to "ask" in `permissions.json`, and
+  `shell.run` can never be set to always-allow — its prompt shows the
+  exact command, every time. (`screen.capture` is a standard
+  capability: its prompt shows a one-line summary and offers
+  always-allow.)
 - **Bridge Activity:** a tray-opened window rendering the audit log in
   plain language, newest first — what ran, what was allowed or refused,
   and why.
@@ -82,7 +86,8 @@ verifies before it will offer you an update at all.
   prompts appear on your PC and time out to "deny" after 60 seconds.
 - Every call is appended to a local audit log
   (`%APPDATA%\Muse\bridge-audit.log`) with a summary — paths, targets,
-  sizes, and (for `shell.run`) the command itself — never file contents.
+  sizes, the captured dimensions for `screen.capture`, and (for
+  `shell.run`) the command itself — never file contents or image data.
 - The updater talks to `api.github.com` only, sends no token, and
   verifies downloads as described above before offering anything.
 

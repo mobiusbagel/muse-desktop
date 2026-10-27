@@ -22,6 +22,7 @@ const DEFAULT_POLICY = {
     'process.list': 'ask',
     'process.kill': 'ask',
     'shell.run': 'ask',
+    'screen.capture': 'ask',
   },
   approvedFolders: [],
 };

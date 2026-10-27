@@ -11,6 +11,7 @@ const CAPABILITY_LABELS = {
   'process.list': 'List running processes',
   'process.kill': 'End a process',
   'shell.run': 'Run a command',
+  'screen.capture': 'Take a screenshot',
 };
 
 async function init() {

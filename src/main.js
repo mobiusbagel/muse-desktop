@@ -4,7 +4,7 @@
 // (Phase 2).
 'use strict';
 
-const { app, globalShortcut, ipcMain, dialog } = require('electron');
+const { app, globalShortcut, ipcMain, dialog, desktopCapturer } = require('electron');
 const os = require('os');
 const path = require('path');
 const { createMainWindow } = require('./mainWindow');
@@ -20,6 +20,7 @@ const { createActivityWindow, registerActivityHandlers } = require('./activityWi
 const { registerSettingsHandlers } = require('./settingsHandlers');
 const { ensureBridgeToken } = require('./bridgeAuth');
 const { createRpcHandler } = require('./rpc');
+const { createScreenCapture } = require('./screenCapture');
 const { createUpdater } = require('./updater');
 const { createPermissionPromptService } = require('./promptService');
 const { appendAuditLog } = require('./bridgeAudit');
@@ -283,6 +284,11 @@ if (!gotSingleInstanceLock) {
       getSettings: () => context.settings,
       isMoving: () => context.moving,
       prompt: (request) => promptService.ask(request),
+      // 0.5.1: screen.capture runs on Electron's desktopCapturer;
+      // screenCapture.js holds the (unit-tested) validation/scaling.
+      captureScreen: createScreenCapture({
+        getSources: (options) => desktopCapturer.getSources(options),
+      }),
     });
 
     bridgeDeps = {

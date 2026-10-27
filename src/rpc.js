@@ -9,6 +9,12 @@
 // prompt (always shown — the capability can never run on a stored
 // "allow") displaying the exact command, plus the audit log.
 //
+// screen.capture (0.5.1) is the opposite case: a standard-family
+// capability (a stored "allow" is honored, "always allow" can be
+// granted on the prompt), no path to scope, gated + audited like the
+// rest. Its audit summary carries the captured dimensions — never
+// image data.
+//
 // One audit line is appended per call (see bridgeAudit.js).
 //
 // This module is deliberately Electron-free: the permission prompt and
@@ -28,6 +34,11 @@ const {
 } = require('./permissions');
 const { folderSizeBytes } = require('./assistantFolder');
 const { appendAuditLog } = require('./bridgeAudit');
+const {
+  ScreenCaptureError,
+  validateCaptureParams,
+  describeCaptureRequest,
+} = require('./screenCapture');
 
 const MAX_READ_BYTES = 1024 * 1024; // fs.read hard cap: 1 MB
 const BYTES_PER_GB = 1024 ** 3;
@@ -56,13 +67,16 @@ const METHOD_CAPABILITY = {
   'process.list': 'process.list',
   'process.kill': 'process.kill',
   'shell.run': 'shell.run',
+  'screen.capture': 'screen.capture',
 };
 
 const FS_METHODS = new Set(['fs.list', 'fs.read', 'fs.write', 'fs.mkdir']);
 // Methods refused with storage_moving while an assistant-folder move
-// runs: the fs tools (their scope is in flux) and shell.run (its
-// working directory is the assistant folder being moved).
-const MOVING_REFUSED_METHODS = new Set([...FS_METHODS, 'shell.run']);
+// runs: the fs tools (their scope is in flux), shell.run (its
+// working directory is the assistant folder being moved), and
+// screen.capture — the read-side methods all pause during a move,
+// and screen.capture follows its nearest siblings.
+const MOVING_REFUSED_METHODS = new Set([...FS_METHODS, 'shell.run', 'screen.capture']);
 const REFUSAL_CODES = new Set(['permission_denied', 'permission_timeout', 'scope_refused', 'storage_moving']);
 
 // ---------------------------------------------------------------------------
@@ -301,10 +315,12 @@ function capCommandForAudit(command) {
   return command.slice(0, AUDIT_COMMAND_CAP_CHARS) + '…';
 }
 
-function paramsSummary(method, params) {
+function paramsSummary(method, params, result) {
   // Paths / targets / pids only — never file contents. shell.run is the
   // one deliberate exception: its "content" IS the action, so the
-  // (capped) command is the summary.
+  // (capped) command is the summary. screen.capture's summary is the
+  // request plus, on success, the captured dimensions from the result
+  // — never the image data itself.
   switch (method) {
     case 'fs.list':
     case 'fs.read':
@@ -321,6 +337,13 @@ function paramsSummary(method, params) {
       return { pid: params && params.pid };
     case 'shell.run':
       return { summary: capCommandForAudit(params && params.command) };
+    case 'screen.capture':
+      return {
+        displayIndex: params && params.displayIndex,
+        ...(result && Number.isInteger(result.width) && Number.isInteger(result.height)
+          ? { width: result.width, height: result.height }
+          : {}),
+      };
     default:
       return {};
   }
@@ -338,9 +361,24 @@ function promptDetail(method, params, resolvedPath) {
       // The prompt shows the EXACT command string, untruncated — the
       // user approves precisely what will run.
       return params.command;
+    case 'screen.capture':
+      // One-line summary: which display, how wide at most. Params were
+      // validated before the gate, so the numbers shown are the
+      // numbers that will run.
+      return describeCaptureRequest(params);
     default:
       return resolvedPath || String(params && params.path);
   }
+}
+
+// Default screen.capture implementation: none. Capture needs an OS
+// capturer, which only main.js can provide (Electron's
+// desktopCapturer via screenCapture.js); a handler built without one
+// fails cleanly instead of pretending.
+function defaultCaptureScreen() {
+  return Promise.reject(
+    new RpcError('tool_failed', 'Screen capture is not available in this run.'),
+  );
 }
 
 function createRpcHandler(deps) {
@@ -354,13 +392,14 @@ function createRpcHandler(deps) {
     listProcesses = defaultListProcesses,
     killProcess = defaultKillProcess,
     runShell = defaultRunShell,
+    captureScreen = defaultCaptureScreen,
   } = deps;
 
-  function audit(method, params, decision, outcome, errorCode) {
+  function audit(method, params, decision, outcome, errorCode, result) {
     appendAuditLog(userDataPath, {
       ts: new Date().toISOString(),
       method,
-      params: paramsSummary(method, params),
+      params: paramsSummary(method, params, result),
       decision,
       outcome,
       ...(errorCode ? { error: errorCode } : {}),
@@ -494,6 +533,17 @@ function createRpcHandler(deps) {
             : DEFAULT_SHELL_TIMEOUT_MS;
         return runShell(params.command, { timeoutMs, cwd: settings.assistantFolder });
       }
+      case 'screen.capture': {
+        // Param validation + capture live in screenCapture.js; its
+        // ScreenCaptureError codes map straight onto RpcError so the
+        // client sees the usual shape (invalid_params included).
+        try {
+          return await captureScreen(params);
+        } catch (err) {
+          if (err instanceof ScreenCaptureError) throw new RpcError(err.code, err.message);
+          throw err;
+        }
+      }
       default:
         throw new RpcError('unknown_method', `Unknown method: ${method}`);
     }
@@ -521,6 +571,20 @@ function createRpcHandler(deps) {
       // reach it.
       if (method === 'shell.run' && (typeof params.command !== 'string' || params.command.trim() === '')) {
         throw new RpcError('invalid_params', 'shell.run requires a non-empty string "command" parameter.');
+      }
+
+      // screen.capture validates BEFORE the gate for the same reason:
+      // the prompt displays the effective display + max width, so an
+      // invalid pair must never reach it. (An out-of-range display
+      // INDEX can only be discovered by enumerating screens, which
+      // happens after the gate, inside the capture itself.)
+      if (method === 'screen.capture') {
+        try {
+          validateCaptureParams(params);
+        } catch (err) {
+          if (err instanceof ScreenCaptureError) throw new RpcError(err.code, err.message);
+          throw err;
+        }
       }
 
       // Scope first: never prompt for a path that will be refused anyway.
@@ -578,7 +642,7 @@ function createRpcHandler(deps) {
       }
 
       const result = await execute(method, params, canonicalTarget, settings);
-      audit(method, params, decision, 'ok');
+      audit(method, params, decision, 'ok', undefined, result);
       return result;
     } catch (err) {
       const rpcErr =

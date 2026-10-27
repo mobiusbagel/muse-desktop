@@ -24,6 +24,13 @@
 // fingerprint pinned to the real signing cert, fail-closed composition
 // (either check failing blocks the offer and leaves an audit line),
 // the self-swap script, and non-portable apply refusal.
+// 0.5.1 coverage: screen.capture (screenCapture.js + the rpc wiring) —
+// standard-family permission behavior (stored "allow" honored,
+// always-allow persists — the shell.run contrast), pre-gate param
+// validation, the prompt's one-line summary, capture flow against a
+// fake capturer (downscale math, display selection, out-of-range /
+// no-screens errors), the moving-state refusal, and an audit summary
+// that carries dimensions but never image data.
 // Run: npm test
 'use strict';
 
@@ -34,7 +41,20 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { createRpcHandler, _internals } = require('../src/rpc');
-const { effectivePolicyMode, sanitizePromptAnswer, NEVER_ALLOW_CAPABILITIES } = require('../src/permissions');
+const {
+  effectivePolicyMode,
+  sanitizePromptAnswer,
+  NEVER_ALLOW_CAPABILITIES,
+  DEFAULT_POLICY,
+  loadPolicy,
+} = require('../src/permissions');
+const {
+  ScreenCaptureError,
+  validateCaptureParams,
+  describeCaptureRequest,
+  computeScaledSize,
+  createScreenCapture,
+} = require('../src/screenCapture');
 const {
   parseAuditLogText,
   formatActivity,
@@ -1304,10 +1324,10 @@ function releaseJson(version, { withExe = true, withSums = true } = {}) {
 
 const jsonFetch = (payload) => async () => ({ ok: true, status: 200, json: async () => payload });
 
-// The signed 0.5.0 portable in dist/ is the fixture for the real-cert
+// The signed 0.5.1 portable in dist/ is the fixture for the real-cert
 // tests. Temp roots for updater runs live on the workspace disk (the
 // fixture is ~109 MB; /tmp is a small tmpfs on the build VM).
-const SIGNED_EXE_FIXTURE = path.join(__dirname, '..', 'dist', 'Muse-Portable-0.5.0.exe');
+const SIGNED_EXE_FIXTURE = path.join(__dirname, '..', 'dist', 'Muse-Portable-0.5.1.exe');
 const REAL_CERT_DER = path.join(__dirname, '..', 'signing', 'muse-signing-cert.cer');
 const haveUpdaterFixtures = fs.existsSync(SIGNED_EXE_FIXTURE) && fs.existsSync(REAL_CERT_DER);
 
@@ -1709,6 +1729,287 @@ test('0.5.0 updater: cleanupStaleArtifacts removes a leftover swap script', () =
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// --- 0.5.1: screen.capture -------------------------------------------------
+
+// A NativeImage-shaped stub: getSize/isEmpty/resize/toPNG, with resize
+// calls optionally recorded so tests can prove "never upscale".
+function fakeImage(width, height, track) {
+  const img = {
+    width,
+    height,
+    getSize() {
+      return { width: img.width, height: img.height };
+    },
+    isEmpty() {
+      return img.width === 0 || img.height === 0;
+    },
+    resize({ width: w, height: h }) {
+      if (track) track.push({ width: w, height: h });
+      return fakeImage(w, h, track);
+    },
+    toPNG() {
+      return Buffer.from(`PNG:${img.width}x${img.height}`);
+    },
+  };
+  return img;
+}
+
+// A desktopCapturer.getSources-shaped stub over the given thumbnails.
+function fakeGetSources(images, seenOptions) {
+  return async (options) => {
+    if (seenOptions) seenOptions.push(options);
+    return images.map((thumbnail, i) => ({ id: `screen:${i}`, name: `Display ${i + 1}`, thumbnail }));
+  };
+}
+
+async function expectCaptureError(promise, code) {
+  try {
+    await promise;
+  } catch (err) {
+    assert.ok(err instanceof ScreenCaptureError, `expected ScreenCaptureError, got: ${err && err.message}`);
+    assert.strictEqual(err.code, code, `expected capture error ${code}, got ${err.code}`);
+    return err;
+  }
+  assert.fail(`expected ScreenCaptureError ${code}, but the call succeeded`);
+}
+
+const CAPTURE_FIXTURE = { format: 'png', width: 2560, height: 1440, displayIndex: 0, dataBase64: 'AAAA' };
+
+test('0.5.1 permissions: screen.capture defaults to ask and is standard-family (no never-allow)', () => {
+  assert.strictEqual(DEFAULT_POLICY.capabilities['screen.capture'], 'ask');
+  assert.strictEqual(NEVER_ALLOW_CAPABILITIES.has('screen.capture'), false);
+  assert.strictEqual(effectivePolicyMode('screen.capture', 'allow'), 'allow', 'a stored allow is NOT coerced');
+  assert.deepStrictEqual(sanitizePromptAnswer('screen.capture', { allowed: true, alwaysAllow: true }), {
+    allowed: true,
+    alwaysAllow: true,
+  });
+  // An existing policy file without the key gains the default via the
+  // loadPolicy defaults-merge (makeEnv's file has no screen.capture).
+  const env = makeEnv();
+  assert.strictEqual(loadPolicy(env.userDataPath).capabilities['screen.capture'], 'ask');
+});
+
+test('0.5.1 screen.capture: a stored "allow" runs without prompting (contrast: shell.run)', async () => {
+  const env = makeEnv({ 'screen.capture': 'allow' });
+  let prompts = 0;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompts += 1;
+      return { allowed: true };
+    },
+    captureScreen: async () => CAPTURE_FIXTURE,
+  });
+  const result = await rpc('screen.capture', {});
+  assert.deepStrictEqual(result, CAPTURE_FIXTURE);
+  assert.strictEqual(prompts, 0, 'stored allow must skip the prompt for screen.capture');
+  const last = env.auditEntries().at(-1);
+  assert.strictEqual(last.decision, 'allow');
+  assert.strictEqual(last.params.width, 2560);
+  assert.strictEqual(last.params.height, 1440);
+});
+
+test('0.5.1 screen.capture: ask + always-allow persists and stops prompting', async () => {
+  const env = makeEnv(); // no screen.capture key on disk → default "ask"
+  let prompts = 0;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompts += 1;
+      return { allowed: true, alwaysAllow: true };
+    },
+    captureScreen: async () => CAPTURE_FIXTURE,
+  });
+  await rpc('screen.capture', {});
+  assert.strictEqual(env.readPolicy().capabilities['screen.capture'], 'allow', 'always-allow persisted');
+  await rpc('screen.capture', {});
+  assert.strictEqual(prompts, 1, 'the second call runs on the stored allow');
+  assert.deepStrictEqual(
+    env.auditEntries().map((e) => e.decision),
+    ['ask-granted', 'allow'],
+  );
+});
+
+test('0.5.1 screen.capture: prompt payload is the one-line summary, always-allow offered', async () => {
+  const env = makeEnv();
+  const seen = [];
+  const rpc = makeHandler(env, {
+    prompt: async (req) => {
+      seen.push(req);
+      return { allowed: true };
+    },
+    captureScreen: async () => CAPTURE_FIXTURE,
+  });
+  await rpc('screen.capture', {});
+  assert.strictEqual(seen[0].capability, 'screen.capture');
+  assert.strictEqual(seen[0].detail, 'Take a screenshot — display 1, up to 2560px wide');
+  assert.strictEqual(seen[0].canAlwaysAllow, true);
+  await rpc('screen.capture', { displayIndex: 1, maxWidth: 1920 });
+  assert.strictEqual(seen[1].detail, 'Take a screenshot — display 2, up to 1920px wide');
+  assert.strictEqual(describeCaptureRequest({}), 'Take a screenshot — display 1, up to 2560px wide');
+});
+
+test('0.5.1 screen.capture: invalid params fail before the gate (no prompt, no capture)', async () => {
+  const env = makeEnv({ 'screen.capture': 'ask' });
+  let prompts = 0;
+  let captures = 0;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompts += 1;
+      return { allowed: true };
+    },
+    captureScreen: async () => {
+      captures += 1;
+      return CAPTURE_FIXTURE;
+    },
+  });
+  for (const params of [
+    { displayIndex: -1 },
+    { displayIndex: 1.5 },
+    { displayIndex: '0' },
+    { maxWidth: 0 },
+    { maxWidth: -100 },
+    { maxWidth: 99999 },
+    { maxWidth: 'wide' },
+  ]) {
+    await expectRpcError(rpc('screen.capture', params), 'invalid_params');
+  }
+  assert.strictEqual(prompts, 0, 'an invalid request must never reach the prompt');
+  assert.strictEqual(captures, 0);
+});
+
+test('0.5.1 screen.capture: moving state refuses with storage_moving', async () => {
+  const env = makeEnv({ 'screen.capture': 'allow' });
+  let captures = 0;
+  const rpc = makeHandler(env, {
+    isMoving: () => true,
+    captureScreen: async () => {
+      captures += 1;
+      return CAPTURE_FIXTURE;
+    },
+  });
+  await expectRpcError(rpc('screen.capture', {}), 'storage_moving');
+  assert.strictEqual(captures, 0);
+  assert.strictEqual(env.auditEntries().at(-1).decision, 'storage-moving');
+});
+
+test('0.5.1 screen.capture: out-of-range display surfaces as invalid_params after the gate', async () => {
+  const env = makeEnv({ 'screen.capture': 'allow' });
+  const rpc = makeHandler(env, {
+    captureScreen: createScreenCapture({ getSources: fakeGetSources([fakeImage(1920, 1080)]) }),
+  });
+  await expectRpcError(rpc('screen.capture', { displayIndex: 5 }), 'invalid_params');
+  const last = env.auditEntries().at(-1);
+  assert.strictEqual(last.outcome, 'error');
+  assert.strictEqual(last.error, 'invalid_params');
+});
+
+test('0.5.1 screen.capture: audit carries dimensions and never image data', async () => {
+  const env = makeEnv({ 'screen.capture': 'allow' });
+  const rpc = makeHandler(env, {
+    captureScreen: createScreenCapture({ getSources: fakeGetSources([fakeImage(4000, 2000)]) }),
+  });
+  const result = await rpc('screen.capture', {});
+  assert.deepStrictEqual(
+    { format: result.format, width: result.width, height: result.height, displayIndex: result.displayIndex },
+    { format: 'png', width: 2560, height: 1280, displayIndex: 0 },
+  );
+  const rawLog = fs.readFileSync(path.join(env.userDataPath, 'bridge-audit.log'), 'utf8');
+  assert.ok(!rawLog.includes(result.dataBase64), 'the base64 image must never reach the audit log');
+  assert.ok(!rawLog.includes('dataBase64'), 'no image-data field in the audit entry');
+  const entry = env.auditEntries().at(-1);
+  assert.strictEqual(entry.params.width, 2560);
+  assert.strictEqual(entry.params.height, 1280);
+});
+
+test('0.5.1 capture: a wide source is downscaled to maxWidth, proportionally', async () => {
+  const capture = createScreenCapture({ getSources: fakeGetSources([fakeImage(5120, 2880)]) });
+  const result = await capture({});
+  assert.strictEqual(result.format, 'png');
+  assert.strictEqual(result.width, 2560);
+  assert.strictEqual(result.height, 1440);
+  assert.strictEqual(result.displayIndex, 0);
+  assert.strictEqual(Buffer.from(result.dataBase64, 'base64').toString(), 'PNG:2560x1440');
+});
+
+test('0.5.1 capture: a custom maxWidth is honored', async () => {
+  const capture = createScreenCapture({ getSources: fakeGetSources([fakeImage(3000, 1500)]) });
+  const result = await capture({ maxWidth: 1200 });
+  assert.strictEqual(result.width, 1200);
+  assert.strictEqual(result.height, 600);
+});
+
+test('0.5.1 capture: a narrower source is never upscaled (resize untouched)', async () => {
+  const track = [];
+  const capture = createScreenCapture({ getSources: fakeGetSources([fakeImage(1920, 1080, track)]) });
+  const result = await capture({});
+  assert.strictEqual(result.width, 1920);
+  assert.strictEqual(result.height, 1080);
+  assert.deepStrictEqual(track, [], 'no resize call when the source already fits');
+  // Exactly maxWidth wide is also left alone.
+  const exact = createScreenCapture({ getSources: fakeGetSources([fakeImage(2560, 1440, track)]) });
+  await exact({});
+  assert.deepStrictEqual(track, []);
+});
+
+test('0.5.1 capture: displayIndex selects the source; capturer asked for screens only', async () => {
+  const seenOptions = [];
+  const capture = createScreenCapture({
+    getSources: fakeGetSources([fakeImage(1000, 500), fakeImage(2000, 1000)], seenOptions),
+  });
+  const result = await capture({ displayIndex: 1 });
+  assert.strictEqual(result.displayIndex, 1);
+  assert.strictEqual(result.width, 2000);
+  assert.strictEqual(result.height, 1000);
+  assert.deepStrictEqual(seenOptions[0].types, ['screen']);
+  assert.deepStrictEqual(seenOptions[0].thumbnailSize, { width: 2560, height: 2560 });
+});
+
+test('0.5.1 capture: out-of-range display and no-screens are clean errors', async () => {
+  const one = createScreenCapture({ getSources: fakeGetSources([fakeImage(1920, 1080)]) });
+  await expectCaptureError(one({ displayIndex: 3 }), 'invalid_params');
+  const none = createScreenCapture({ getSources: async () => [] });
+  await expectCaptureError(none({}), 'no_screens');
+  const broken = createScreenCapture({
+    getSources: async () => {
+      throw new Error('capturer exploded');
+    },
+  });
+  await expectCaptureError(broken({}), 'tool_failed');
+});
+
+test('0.5.1 capture: module-level param validation (defaults, bounds, types)', async () => {
+  assert.deepStrictEqual(validateCaptureParams({}), { displayIndex: 0, maxWidth: 2560 });
+  assert.deepStrictEqual(validateCaptureParams({ displayIndex: 2, maxWidth: 800 }), { displayIndex: 2, maxWidth: 800 });
+  const capture = createScreenCapture({ getSources: fakeGetSources([fakeImage(640, 480)]) });
+  for (const params of [
+    { displayIndex: -1 },
+    { displayIndex: 0.5 },
+    { displayIndex: '0' },
+    { maxWidth: 0 },
+    { maxWidth: 15 },
+    { maxWidth: 16385 },
+    { maxWidth: 2560.5 },
+    { maxWidth: 'wide' },
+  ]) {
+    await expectCaptureError(capture(params), 'invalid_params');
+  }
+});
+
+test('0.5.1 capture: scaling math', () => {
+  assert.deepStrictEqual(computeScaledSize(5120, 2880, 2560), { width: 2560, height: 1440, scaled: true });
+  assert.deepStrictEqual(computeScaledSize(1920, 1080, 2560), { width: 1920, height: 1080, scaled: false });
+  assert.deepStrictEqual(computeScaledSize(2560, 1440, 2560), { width: 2560, height: 1440, scaled: false });
+  assert.deepStrictEqual(computeScaledSize(1080, 1920, 800), { width: 800, height: 1422, scaled: true });
+  assert.deepStrictEqual(computeScaledSize(3840, 2160, 1000), { width: 1000, height: 563, scaled: true });
+});
+
+test('0.5.1 activity: screenshot describe line', () => {
+  assert.strictEqual(
+    describeEntry({ method: 'screen.capture', params: { width: 2560, height: 1440 } }),
+    'Screenshot: 2560x1440',
+  );
+  assert.strictEqual(describeEntry({ method: 'screen.capture', params: {} }), 'Screenshot');
 });
 
 // ---------------------------------------------------------------------------

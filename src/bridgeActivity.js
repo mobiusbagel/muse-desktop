@@ -68,6 +68,9 @@ function describeEntry(entry) {
       return `Kill process pid ${params.pid ?? ''}`;
     case 'shell.run':
       return `Run command: ${params.summary ?? ''}`;
+    case 'screen.capture':
+      // Dimensions ride in the audit summary (never image data).
+      return params.width && params.height ? `Screenshot: ${params.width}x${params.height}` : 'Screenshot';
     case null:
     case undefined:
       if (entry.event === 'tailnet_listener_bound') {
