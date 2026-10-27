@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="icon" type="image/png" href="../../assets/tray-32.png">
+<title>Muse — Bridge Activity</title>
+<style>
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    margin: 0;
+    padding: 18px 22px;
+    color: #1c1c28;
+    background: #f7f6fb;
+  }
+  .bar { display: flex; align-items: center; margin-bottom: 12px; }
+  h1 { font-size: 16px; margin: 0; flex: 1; }
+  button {
+    font-size: 13px; padding: 6px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid #b9b3d9; background: #fff; color: #1c1c28;
+  }
+  button:hover { filter: brightness(0.97); }
+  .empty { font-size: 13.5px; color: #5a5872; padding: 10px 2px; }
+  .row {
+    display: flex; gap: 12px; align-items: baseline;
+    background: #fff; border: 1px solid #ddd9ec; border-radius: 8px;
+    padding: 8px 12px; margin-bottom: 8px;
+    font-size: 13px;
+  }
+  .time { color: #5a5872; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .summary {
+    flex: 1; min-width: 0;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .decision { white-space: nowrap; font-weight: 600; }
+  .outcome { white-space: nowrap; color: #5a5872; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <h1>Bridge Activity</h1>
+    <button id="refresh" type="button">Refresh</button>
+  </div>
+  <div id="list"></div>
+  <script src="renderer.js"></script>
+</body>
+</html>

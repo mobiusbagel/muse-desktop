@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" />
+<link rel="icon" type="image/png" href="../../assets/tray-32.png" />
+<title>Muse — Assistant Folder &amp; Storage</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    margin: 0; padding: 20px 22px; background: #14161c; color: #e8eaf2;
+    font-size: 14px; line-height: 1.45;
+  }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: #9aa3b8; margin: 22px 0 8px; }
+  .sub { color: #9aa3b8; margin: 0 0 6px; }
+  .path {
+    font-family: Consolas, monospace; font-size: 13px; background: #1d2029;
+    border: 1px solid #2c3040; border-radius: 6px; padding: 8px 10px;
+    word-break: break-all;
+  }
+  .bar { height: 8px; background: #262a38; border-radius: 4px; overflow: hidden; margin: 10px 0 6px; }
+  .bar > div { height: 100%; background: #6d58f6; width: 0%; transition: width .2s; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  input[type="number"] {
+    width: 90px; padding: 7px 9px; border-radius: 6px; border: 1px solid #2c3040;
+    background: #1d2029; color: #e8eaf2; font-size: 14px;
+  }
+  button {
+    padding: 8px 14px; border-radius: 6px; border: 1px solid #3a3f55;
+    background: #232636; color: #e8eaf2; font-size: 14px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #2c3049; }
+  button.primary { background: #6d58f6; border-color: #6d58f6; color: #fff; }
+  button.primary:hover:not(:disabled) { background: #7d6bf8; }
+  button:disabled { opacity: .45; cursor: default; }
+  .note { color: #9aa3b8; font-size: 13px; }
+  .status { margin-top: 16px; min-height: 20px; white-space: pre-wrap; }
+  .status.error { color: #ff8a8a; }
+  .hidden { display: none; }
+  .warnbox {
+    border: 1px solid #8a6d1d; background: #2a2410; border-radius: 6px;
+    padding: 10px 12px; margin-top: 12px;
+  }
+  .warnbox .row { margin-top: 8px; }
+  #confirmText { white-space: pre-line; }
+</style>
+</head>
+<body>
+  <h1>Assistant Folder &amp; Storage</h1>
+
+  <h2>Assistant folder</h2>
+  <div class="path" id="folderPath">…</div>
+  <div class="bar"><div id="usageBar"></div></div>
+  <div id="usageText" class="note">…</div>
+
+  <h2>Storage cap</h2>
+  <div class="row">
+    <label for="capInput">Max storage (GB)</label>
+    <input type="number" id="capInput" min="0.1" step="0.5" />
+    <button id="saveCapBtn">Save</button>
+  </div>
+  <div class="row" style="margin-top: 22px">
+    <button id="moveBtn" class="primary">Move folder…</button>
+  </div>
+
+  <h2>Remote access</h2>
+  <div class="row">
+    <input type="checkbox" id="remoteAccessToggle" />
+    <label for="remoteAccessToggle">Tailscale</label>
+  </div>
+  <div id="bridgeStatus" class="note" style="margin-top: 6px">…</div>
+
+  <h2>Updates</h2>
+  <div class="row">
+    <span id="appVersionText">…</span>
+    <span id="updateStatusText" class="note"></span>
+  </div>
+  <div class="row" style="margin-top: 8px">
+    <button id="checkUpdatesBtn">Check now</button>
+    <input type="checkbox" id="autoCheckToggle" />
+    <label for="autoCheckToggle">Check for updates automatically</label>
+  </div>
+
+  <div id="confirmBox" class="warnbox hidden">
+    <div id="confirmText"></div>
+    <div class="row">
+      <button id="confirmBtn" class="primary">Move</button>
+      <button id="confirmCancelBtn">Cancel</button>
+    </div>
+  </div>
+
+  <div id="progressBox" class="hidden">
+    <div class="bar"><div id="progressBar"></div></div>
+    <div class="row">
+      <span id="progressText" class="note">0%</span>
+      <button id="cancelMoveBtn">Cancel</button>
+    </div>
+  </div>
+
+  <div id="status" class="status"></div>
+
+  <script src="../formatBytes.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

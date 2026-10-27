@@ -1,0 +1,57 @@
+{
+  "author": "Muse Desktop",
+  "build": {
+    "appId": "ai.muse.desktop",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**",
+      "assets/**",
+      "package.json"
+    ],
+    "nsis": {
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "Muse-Setup-${version}.${ext}",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "include": "build/installer.nsh",
+      "oneClick": false,
+      "perMachine": false,
+      "shortcutName": "Muse"
+    },
+    "portable": {
+      "artifactName": "Muse-Portable-${version}.${ext}"
+    },
+    "productName": "Muse",
+    "win": {
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "target": "nsis"
+    }
+  },
+  "description": "Muse desktop app for Windows — a standalone shell for muse.ai with system tray, global hotkey, and a local bridge with permission-gated tools, reachable over Tailscale when remote access is on (Phase 3).",
+  "devDependencies": {
+    "electron": "45.0.0",
+    "electron-builder": "26.18.0",
+    "resedit": "3.1.0"
+  },
+  "license": "MIT",
+  "main": "src/main.js",
+  "name": "muse-desktop",
+  "scripts": {
+    "dist": "electron-builder --win nsis",
+    "dist:portable": "electron-builder --win portable --prepackaged dist/win-unpacked",
+    "stamp": "node scripts/stamp-exe.js dist/win-unpacked/Muse.exe",
+    "verify:portable": "node scripts/verify-portable.js",
+    "sign:inner": "node scripts/sign-exe.js inner",
+    "sign:outer": "node scripts/sign-exe.js outer",
+    "sign": "node scripts/sign-exe.js",
+    "release": "npm run pack && npm run stamp && npm run sign:inner && npm run dist:portable && npm run verify:portable && npm run sign:outer",
+    "icons": "python3 scripts/make-icons.py",
+    "pack": "electron-builder --win --dir",
+    "start": "electron .",
+    "test": "node tests/run-tests.js"
+  },
+  "version": "0.5.0"
+}

@@ -1,0 +1,6 @@
+node_modules/
+dist/
+signing/
+*.pfx
+pfx-password.txt
+*token*.txt
