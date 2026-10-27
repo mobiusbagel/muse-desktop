@@ -79,6 +79,9 @@ function describeEntry(entry) {
       if (entry.event === 'update_rejected') {
         return `Update rejected: ${entry.version ?? ''}`.trim();
       }
+      if (entry.event === 'update_apply_started') {
+        return `Update apply started: ${entry.version ?? ''}`.trim();
+      }
       return 'Bridge call';
     default:
       return String(entry.method);
@@ -100,6 +103,8 @@ function decisionText(entry) {
       return 'denied by policy';
     case 'auth-rejected':
       return 'auth rejected';
+    case 'update-apply':
+      return 'applying';
     case 'scope-refused':
       return 'scope refused';
     case 'storage-moving':

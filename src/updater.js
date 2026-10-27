@@ -20,6 +20,14 @@
 // updates: a file the app writes itself carries no Mark of the Web,
 // unlike a browser download.
 //
+// 0.5.2 reworked the apply mechanism (see "The self-swap" below):
+// in 0.5.0/0.5.1 the swap script was spawned as a child of the app
+// and died with the portable stub's process-tree teardown — the
+// app closed and nothing else happened. The swap is now launched
+// through WMI so it survives the app, and it logs every step to
+// updates/apply-update.log, whose tail the app reads at boot to
+// report the last apply's outcome in the settings Updates row.
+//
 // Electron-free by design (same pattern as rpc.js): every outside
 // dependency — fetch, audit sink, the ready prompt, process spawn —
 // is injected, so the whole flow is unit-testable in plain Node.
@@ -28,7 +36,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 
@@ -44,6 +52,11 @@ const LATEST_RELEASE_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases
 const SUMS_ASSET_NAME = 'SHA256SUMS.txt';
 const USER_AGENT = 'Muse-Desktop-Updater';
 const SWAP_SCRIPT_NAME = 'apply-update.ps1';
+const APPLY_LOG_NAME = 'apply-update.log';
+// Copy retries in the swap script: ~60 s at a 500 ms cadence. The
+// portable stub can hold the exe image briefly after the app exits,
+// so the copy has to out-wait it rather than give up in seconds.
+const MAX_COPY_ATTEMPTS = 120;
 
 // ---------------------------------------------------------------------------
 // Versions (tiny semver: numeric core + optional prerelease)
@@ -367,35 +380,68 @@ async function verifyDownloadedUpdate({ exePath, sumsPath, exeName, pinnedFinger
 }
 
 // ---------------------------------------------------------------------------
-// The self-swap script (portable runs only)
+// The self-swap (portable runs only) — reworked in 0.5.2
 // ---------------------------------------------------------------------------
+//
+// The 0.5.0/0.5.1 mechanism spawned the swap script as a detached
+// child of the app — and in the field it produced zero observable
+// effects: the app closed, no copy, no relaunch, no trace. The
+// consistent explanation is that the NSIS portable stub tears down
+// its whole process tree/job on exit and the "detached" child dies
+// with it (detached + unref does not escape a job object). 0.5.2
+// therefore launches the script through WMI (Win32_Process.Create),
+// which parents it to the WMI service — outside the app's tree —
+// and the script itself logs every step to apply-update.log so no
+// future failure is silent.
 
 function psQuote(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-// PowerShell run detached after the app quits: waits for this process
-// to exit, replaces the portable exe with the verified download,
-// relaunches it, and removes the downloaded copy + itself.
-function buildSwapScript({ pid, currentExePath, newExePath }) {
+// The swap script: waits for the app process to exit, replaces the
+// portable exe with the verified download (retrying for ~60 s while
+// the stub lets go of the image), ALWAYS relaunches the target
+// afterwards — old exe or new, the user is never left with a closed
+// app and nothing running — and appends a timestamped line per step
+// to the apply log. The downloaded copy is removed only on success;
+// on failure it stays, verified, for the next attempt.
+function buildSwapScript({ pid, currentExePath, newExePath, logPath, targetVersion }) {
   return [
     "$ErrorActionPreference = 'SilentlyContinue'",
     `$targetPid = ${Number(pid) || 0}`,
     `$newExe = ${psQuote(newExePath)}`,
     `$targetExe = ${psQuote(currentExePath)}`,
-    'if ($targetPid -gt 0) { Wait-Process -Id $targetPid -Timeout 60 -ErrorAction SilentlyContinue }',
-    'Start-Sleep -Milliseconds 400',
-    'for ($i = 0; $i -lt 40; $i++) {',
-    '  try { Copy-Item -LiteralPath $newExe -Destination $targetExe -Force -ErrorAction Stop; break }',
-    '  catch { Start-Sleep -Milliseconds 500 }',
+    `$logFile = ${psQuote(logPath || '')}`,
+    `$targetVersion = ${psQuote(targetVersion || '')}`,
+    'function Write-SwapLog([string]$step) {',
+    '  try { Add-Content -LiteralPath $logFile -Value ("{0} {1}" -f (Get-Date).ToString("o"), $step) -Encoding UTF8 -ErrorAction Stop } catch { }',
     '}',
+    "Write-SwapLog \"started version=$targetVersion pid=$targetPid\"",
+    'if ($targetPid -gt 0) { Wait-Process -Id $targetPid -Timeout 60 -ErrorAction SilentlyContinue; Write-SwapLog \'waited-pid-gone\' }',
+    'Start-Sleep -Milliseconds 400',
+    '$copied = $false',
+    '$attempts = 0',
+    `for ($i = 0; $i -lt ${MAX_COPY_ATTEMPTS}; $i++) {`,
+    '  $attempts = $i + 1',
+    '  try { Copy-Item -LiteralPath $newExe -Destination $targetExe -Force -ErrorAction Stop; $copied = $true; break }',
+    '  catch { Write-SwapLog "copy-attempt-failed attempt=$attempts error=$($_.Exception.Message)"; Start-Sleep -Milliseconds 500 }',
+    '}',
+    'if ($copied) { Write-SwapLog "copy-ok attempts=$attempts" } else { Write-SwapLog "copy-failed attempts=$attempts" }',
     'Start-Process -FilePath $targetExe',
-    'Remove-Item -LiteralPath $newExe -Force -ErrorAction SilentlyContinue',
+    "Write-SwapLog 'relaunch-issued'",
+    'if ($copied) {',
+    '  Remove-Item -LiteralPath $newExe -Force -ErrorAction SilentlyContinue',
+    '  Write-SwapLog "done result=success version=$targetVersion"',
+    '} else {',
+    '  Write-SwapLog "done result=failed version=$targetVersion"',
+    '}',
     'Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue',
     '',
   ].join('\r\n');
 }
 
+// Fallback launcher (the 0.5.0 mechanism): a detached child of the
+// app. Only used when the WMI launch errors — a chance beats none.
 function defaultSpawnSwapScript(scriptPath) {
   const child = spawn(
     'powershell.exe',
@@ -404,6 +450,93 @@ function defaultSpawnSwapScript(scriptPath) {
   );
   child.unref();
   return child;
+}
+
+// The PowerShell -Command the app runs to ask WMI to create the
+// swap process. The inner command line double-quotes the script
+// path (it lives under %APPDATA% and the target path may contain
+// spaces — a real install's does); the whole inner
+// line is then single-quoted for the outer script via psQuote.
+function buildWmiLaunchCommand(scriptPath) {
+  const inner = `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${scriptPath}"`;
+  return (
+    `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${psQuote(inner)} }; ` +
+    'if ($null -eq $r -or $r.ReturnValue -ne 0) { exit 1 }'
+  );
+}
+
+// Primary launcher: synchronously asks WMI to create the swap
+// process, so by the time this returns the request is fully issued
+// and the app may quit safely. Throws on any failure; apply()
+// catches and falls back to the direct spawn.
+function defaultLaunchSwapScript(scriptPath) {
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', buildWmiLaunchCommand(scriptPath)],
+    { stdio: 'ignore', windowsHide: true, timeout: 30_000 },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`WMI swap launch failed (exit ${result.status === null ? 'killed' : result.status})`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The apply log's verdict (boot-time status)
+// ---------------------------------------------------------------------------
+
+// Judges the LAST apply run recorded in apply-update.log against the
+// version now running:
+//   { result: 'success', version } — that run copied `version` in,
+//     and `version` is what is running now.
+//   { result: 'failed', version } — that run ended without applying
+//     `version` (done/failed, or stalled at copy-failed), and
+//     `version` is still ahead of what's running: we're behind it.
+//   { result: 'unknown', version } — a run started but its outcome
+//     lines never landed (killed mid-flight — the 0.5.1 failure).
+//   null — no log, no recognizable run, or the last run's news is
+//     stale (the running version has moved past it either way).
+function parseApplyLog(text, currentVersion) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const lines = text.split(/\r?\n/);
+  let startIdx = -1;
+  let version = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = / started version=(\S+)/.exec(lines[i]);
+    if (m) {
+      startIdx = i;
+      version = m[1];
+    }
+  }
+  if (startIdx < 0 || !version || !parseVersion(version)) return null;
+  let done = null;
+  let copyFailed = false;
+  for (const line of lines.slice(startIdx + 1)) {
+    const d = / done result=(success|failed) version=(\S+)/.exec(line);
+    if (d) done = { result: d[1], version: d[2] };
+    if (/ copy-failed/.test(line)) copyFailed = true;
+  }
+  if (done && done.result === 'success') {
+    return compareVersions(done.version, currentVersion) === 0
+      ? { result: 'success', version: done.version }
+      : null;
+  }
+  if ((done && done.result === 'failed') || copyFailed) {
+    const target = done ? done.version : version;
+    return isNewerVersion(target, currentVersion) ? { result: 'failed', version: target } : null;
+  }
+  const cmp = compareVersions(version, currentVersion);
+  if (cmp === null || cmp < 0) return null;
+  return { result: 'unknown', version };
+}
+
+// The one-line settings label for an apply outcome ('' = say
+// nothing; the row's normal states take over).
+function applyOutcomeLabel(outcome) {
+  if (!outcome) return '';
+  if (outcome.result === 'success') return `Updated to ${outcome.version}`;
+  if (outcome.result === 'failed') return 'Update failed';
+  return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +569,7 @@ function createUpdater(deps) {
     onReady = () => {},
     onApplyStarted = () => {},
     spawnSwapScript = defaultSpawnSwapScript,
+    launchSwapScript = defaultLaunchSwapScript,
     getPid = () => process.pid,
   } = deps;
 
@@ -449,7 +583,22 @@ function createUpdater(deps) {
   let inFlight = null;
 
   function getState() {
-    return { ...state, currentVersion, canApply };
+    return { ...state, currentVersion, canApply, lastApplyOutcome: getLastApplyOutcome() };
+  }
+
+  // The last apply run's verdict from apply-update.log (0.5.2),
+  // judged against the running version — see parseApplyLog. Carries
+  // the log path so the settings layer can point at the record.
+  function getLastApplyOutcome() {
+    const logPath = path.join(updatesRoot, APPLY_LOG_NAME);
+    let text;
+    try {
+      text = fs.readFileSync(logPath, 'utf8');
+    } catch {
+      return null;
+    }
+    const outcome = parseApplyLog(text, currentVersion);
+    return outcome ? { ...outcome, logPath } : null;
   }
 
   function versionDir(version) {
@@ -457,7 +606,9 @@ function createUpdater(deps) {
   }
 
   // A leftover swap script from an applied update removes itself; if
-  // it couldn't (killed mid-run), main calls this at startup.
+  // it couldn't (killed mid-run), main calls this at startup. Only
+  // the script is removed — apply-update.log is deliberately kept:
+  // it is the diagnostic record getLastApplyOutcome() reads.
   function cleanupStaleArtifacts() {
     try {
       fs.rmSync(path.join(updatesRoot, SWAP_SCRIPT_NAME), { force: true });
@@ -551,6 +702,10 @@ function createUpdater(deps) {
   // Applies the verified pending update. Only portable runs can
   // replace their own exe; anything else is refused here (the UI
   // disables the action with a one-line reason before this).
+  // The swap script is launched through WMI (0.5.2) so it survives
+  // the app/portable-stub teardown; if that launch errors, the old
+  // direct spawn is the fallback. Either way the launch path taken
+  // is audited before the app quits.
   function apply() {
     if (state.state !== 'ready' || !state.pendingExePath) {
       return { ok: false, reason: 'no-verified-update' };
@@ -559,14 +714,34 @@ function createUpdater(deps) {
     const currentExePath = getCurrentExePath();
     if (!currentExePath) return { ok: false, reason: 'not-portable' };
     const scriptPath = path.join(updatesRoot, SWAP_SCRIPT_NAME);
-    const script = buildSwapScript({ pid: getPid(), currentExePath, newExePath: state.pendingExePath });
+    const script = buildSwapScript({
+      pid: getPid(),
+      currentExePath,
+      newExePath: state.pendingExePath,
+      logPath: path.join(updatesRoot, APPLY_LOG_NAME),
+      targetVersion: state.pendingVersion,
+    });
     fs.writeFileSync(scriptPath, script);
-    spawnSwapScript(scriptPath);
+    let via = 'wmi';
+    try {
+      launchSwapScript(scriptPath);
+    } catch {
+      via = 'spawn-fallback';
+      spawnSwapScript(scriptPath);
+    }
+    audit({
+      ts: new Date().toISOString(),
+      event: 'update_apply_started',
+      version: state.pendingVersion,
+      decision: 'update-apply',
+      outcome: 'started',
+      via,
+    });
     onApplyStarted();
     return { ok: true };
   }
 
-  return { check, apply, getState, cleanupStaleArtifacts, updatesRoot };
+  return { check, apply, getState, getLastApplyOutcome, cleanupStaleArtifacts, updatesRoot };
 }
 
 module.exports = {
@@ -589,6 +764,13 @@ module.exports = {
   verifyDownloadedUpdate,
   psQuote,
   buildSwapScript,
+  buildWmiLaunchCommand,
+  defaultLaunchSwapScript,
+  parseApplyLog,
+  applyOutcomeLabel,
+  APPLY_LOG_NAME,
+  SWAP_SCRIPT_NAME,
+  MAX_COPY_ATTEMPTS,
   defaultDownloadToFile,
   createUpdater,
 };

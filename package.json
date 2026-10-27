@@ -30,7 +30,7 @@
       "target": "nsis"
     }
   },
-  "description": "Muse desktop app for Windows — a standalone shell for muse.ai with system tray, global hotkey, and a local bridge with permission-gated tools, reachable over Tailscale when remote access is on (Phase 3).",
+  "description": "Muse desktop app for Windows \u2014 a standalone shell for muse.ai with system tray, global hotkey, and a local bridge with permission-gated tools, reachable over Tailscale when remote access is on (Phase 3).",
   "devDependencies": {
     "electron": "45.0.0",
     "electron-builder": "26.18.0",
@@ -53,5 +53,5 @@
     "start": "electron .",
     "test": "node tests/run-tests.js"
   },
-  "version": "0.5.1"
+  "version": "0.5.2"
 }

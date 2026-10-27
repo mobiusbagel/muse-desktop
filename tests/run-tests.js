@@ -24,6 +24,12 @@
 // fingerprint pinned to the real signing cert, fail-closed composition
 // (either check failing blocks the offer and leaves an audit line),
 // the self-swap script, and non-portable apply refusal.
+// 0.5.2 coverage: the updater apply fix — the swap script's step
+// logging + ~60 s lock-aware copy + always-relaunch, the WMI
+// (Win32_Process.Create) launch command and its spawn fallback
+// (audited `via`), the apply log's boot-time outcome parsing
+// (parseApplyLog / getLastApplyOutcome / applyOutcomeLabel), and
+// cleanup keeping the log while removing the stale script.
 // 0.5.1 coverage: screen.capture (screenCapture.js + the rpc wiring) —
 // standard-family permission behavior (stored "allow" honored,
 // always-allow persists — the shell.run contrast), pre-gate param
@@ -88,6 +94,11 @@ const {
   signerFingerprint256FromExe,
   fingerprint256OfCertDer,
   buildSwapScript,
+  buildWmiLaunchCommand,
+  parseApplyLog,
+  applyOutcomeLabel,
+  APPLY_LOG_NAME,
+  MAX_COPY_ATTEMPTS,
   psQuote,
   createUpdater,
 } = require('../src/updater');
@@ -1324,10 +1335,10 @@ function releaseJson(version, { withExe = true, withSums = true } = {}) {
 
 const jsonFetch = (payload) => async () => ({ ok: true, status: 200, json: async () => payload });
 
-// The signed 0.5.1 portable in dist/ is the fixture for the real-cert
+// The signed 0.5.2 portable in dist/ is the fixture for the real-cert
 // tests. Temp roots for updater runs live on the workspace disk (the
 // fixture is ~109 MB; /tmp is a small tmpfs on the build VM).
-const SIGNED_EXE_FIXTURE = path.join(__dirname, '..', 'dist', 'Muse-Portable-0.5.1.exe');
+const SIGNED_EXE_FIXTURE = path.join(__dirname, '..', 'dist', 'Muse-Portable-0.5.2.exe');
 const REAL_CERT_DER = path.join(__dirname, '..', 'signing', 'muse-signing-cert.cer');
 const haveUpdaterFixtures = fs.existsSync(SIGNED_EXE_FIXTURE) && fs.existsSync(REAL_CERT_DER);
 
@@ -1621,7 +1632,7 @@ test('0.5.0 updater: not-newer release → up-to-date, no downloads', async () =
   }
 });
 
-test('0.5.0 updater: verified download → ready; portable apply writes + spawns the swap script', async () => {
+test('0.5.0 updater: verified download → ready; portable apply writes + launches the swap script (WMI, 0.5.2)', async () => {
   if (!haveUpdaterFixtures) {
     console.log('     (skipped: signed dist fixture not present)');
     return;
@@ -1629,6 +1640,8 @@ test('0.5.0 updater: verified download → ready; portable apply writes + spawns
   const root = updaterTmpRoot('flow-ready');
   const currentExe = path.join(root, 'Muse-Portable-0.5.0.exe');
   const readyInfos = [];
+  const audits = [];
+  let launchedScript = null;
   let spawnedScript = null;
   let applyStarted = false;
   try {
@@ -1644,7 +1657,11 @@ test('0.5.0 updater: verified download → ready; portable apply writes + spawns
         ['.exe', (dest) => fs.copyFileSync(SIGNED_EXE_FIXTURE, dest)],
         ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable-9.9.9.exe\n`)],
       ]),
+      audit: (entry) => audits.push(entry),
       onReady: (info) => readyInfos.push(info),
+      launchSwapScript: (scriptPath) => {
+        launchedScript = scriptPath;
+      },
       spawnSwapScript: (scriptPath) => {
         spawnedScript = scriptPath;
       },
@@ -1660,14 +1677,20 @@ test('0.5.0 updater: verified download → ready; portable apply writes + spawns
 
     const applied = updater.apply();
     assert.deepStrictEqual(applied, { ok: true });
-    assert.ok(spawnedScript && fs.existsSync(spawnedScript), 'the swap script was written and spawned');
-    const script = fs.readFileSync(spawnedScript, 'utf8');
+    assert.ok(launchedScript && fs.existsSync(launchedScript), 'the swap script was written and launched via WMI');
+    assert.strictEqual(spawnedScript, null, 'the direct-spawn fallback is not used when WMI succeeds');
+    const script = fs.readFileSync(launchedScript, 'utf8');
     assert.ok(script.includes('$targetPid = 4242'), 'the script waits for this PID');
     assert.ok(script.includes(`$targetExe = '${currentExe}'`), 'the target path is quoted');
     assert.ok(script.includes('Wait-Process'), 'waits for exit');
     assert.ok(script.includes('Copy-Item'), 'replaces the exe');
     assert.ok(script.includes('Start-Process'), 'relaunches');
     assert.strictEqual(applyStarted, true, 'the app is told to quit');
+    const applyAudit = audits.find((a) => a.event === 'update_apply_started');
+    assert.ok(applyAudit, 'the apply is audited');
+    assert.strictEqual(applyAudit.version, '9.9.9');
+    assert.strictEqual(applyAudit.via, 'wmi', 'the audit records the WMI launch path');
+    assert.strictEqual(applyAudit.outcome, 'started');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1729,6 +1752,231 @@ test('0.5.0 updater: cleanupStaleArtifacts removes a leftover swap script', () =
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// --- 0.5.2: the updater apply fix ------------------------------------------
+
+test('0.5.2 swap script: every stage is logged and the target always relaunches', () => {
+  const script = buildSwapScript({
+    pid: 99,
+    currentExePath: 'E:\\Tools\\Muse Desktop\\Muse-Portable-0.5.1.exe',
+    newExePath: 'C:\\Users\\Some One\\AppData\\Roaming\\Muse\\updates\\0.5.2\\Muse-Portable-0.5.2.exe',
+    logPath: 'C:\\Users\\Some One\\AppData\\Roaming\\Muse\\updates\\apply-update.log',
+    targetVersion: '0.5.2',
+  });
+  assert.ok(script.includes("$targetExe = 'E:\\Tools\\Muse Desktop\\Muse-Portable-0.5.1.exe'"), 'spaced target path quoted');
+  assert.ok(script.includes("$logFile = 'C:\\Users\\Some One\\AppData\\Roaming\\Muse\\updates\\apply-update.log'"));
+  assert.ok(script.includes("$targetVersion = '0.5.2'"));
+  assert.ok(script.includes('Add-Content -LiteralPath $logFile'), 'the logger appends to the apply log');
+  for (const step of [
+    'started version=$targetVersion',
+    'waited-pid-gone',
+    'copy-attempt-failed attempt=$attempts error=',
+    'copy-ok attempts=$attempts',
+    'copy-failed attempts=$attempts',
+    'relaunch-issued',
+    'done result=success version=$targetVersion',
+    'done result=failed version=$targetVersion',
+  ]) {
+    assert.ok(script.includes(step), `the script logs: ${step}`);
+  }
+  assert.ok(script.includes(`for ($i = 0; $i -lt ${MAX_COPY_ATTEMPTS}; $i++)`), 'the retry loop uses the shared attempt budget');
+  assert.ok(MAX_COPY_ATTEMPTS >= 100, 'the copy window is ~60 s, not the old ~20 s');
+  const copyFailedAt = script.indexOf('copy-failed attempts=');
+  const relaunchAt = script.indexOf('Start-Process -FilePath $targetExe');
+  assert.ok(relaunchAt > copyFailedAt, 'Start-Process sits after the copy loop — it runs even when the copy failed');
+  const removeDownloadAt = script.indexOf('Remove-Item -LiteralPath $newExe');
+  assert.ok(removeDownloadAt > relaunchAt, 'the verified download is removed only after the relaunch');
+  assert.ok(script.indexOf('if ($copied) {', relaunchAt) > relaunchAt, '...and only inside the success branch');
+  assert.ok(script.includes('Remove-Item -LiteralPath $PSCommandPath'), 'the script still cleans up after itself');
+});
+
+test('0.5.2 WMI launch command: exact quoting for paths with spaces (and apostrophes)', () => {
+  const spaced = 'E:\\Tools\\Muse Desktop\\updates\\apply-update.ps1';
+  assert.strictEqual(
+    buildWmiLaunchCommand(spaced),
+    "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = " +
+      `'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "E:\\Tools\\Muse Desktop\\updates\\apply-update.ps1"' }; ` +
+      'if ($null -eq $r -or $r.ReturnValue -ne 0) { exit 1 }',
+    'the script path is double-quoted inside the WMI command line, single-quoted outside',
+  );
+  const apostrophe = buildWmiLaunchCommand("C:\\Users\\It's Me\\updates\\apply-update.ps1");
+  assert.ok(
+    apostrophe.includes(`-File "C:\\Users\\It''s Me\\updates\\apply-update.ps1"`),
+    "an apostrophe in the path is doubled for the PowerShell string literal",
+  );
+  assert.ok(apostrophe.includes('Win32_Process'), 'the process is created through WMI');
+});
+
+test('0.5.2 apply: a WMI launch failure falls back to the direct spawn and audits via', async () => {
+  if (!haveUpdaterFixtures) {
+    console.log('     (skipped: signed dist fixture not present)');
+    return;
+  }
+  const root = updaterTmpRoot('flow-fallback');
+  const audits = [];
+  let spawnedScript = null;
+  let applyStarted = false;
+  try {
+    const fixtureHash = crypto.createHash('sha256').update(fs.readFileSync(SIGNED_EXE_FIXTURE)).digest('hex');
+    const updater = createUpdater({
+      currentVersion: '0.5.1',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => path.join(root, 'Muse-Portable-0.5.1.exe'),
+      fetchImpl: jsonFetch(releaseJson('9.9.9')),
+      downloadToFile: stubDownload([
+        ['.exe', (dest) => fs.copyFileSync(SIGNED_EXE_FIXTURE, dest)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable-9.9.9.exe\n`)],
+      ]),
+      audit: (entry) => audits.push(entry),
+      launchSwapScript: () => {
+        throw new Error('WMI unavailable');
+      },
+      spawnSwapScript: (scriptPath) => {
+        spawnedScript = scriptPath;
+      },
+      onApplyStarted: () => {
+        applyStarted = true;
+      },
+    });
+    const state = await updater.check();
+    assert.strictEqual(state.state, 'ready');
+    assert.deepStrictEqual(updater.apply(), { ok: true }, 'a failed WMI launch does not block the apply');
+    assert.ok(spawnedScript && fs.existsSync(spawnedScript), 'the fallback spawn ran the script');
+    const applyAudit = audits.find((a) => a.event === 'update_apply_started');
+    assert.ok(applyAudit, 'the fallback apply is audited');
+    assert.strictEqual(applyAudit.via, 'spawn-fallback', 'the audit names the fallback path');
+    assert.strictEqual(applyStarted, true, 'the app is still told to quit');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.2 apply: refuses with no verified update pending', () => {
+  const root = updaterTmpRoot('flow-nopending');
+  try {
+    const updater = createUpdater({ currentVersion: '0.5.2', userDataPath: root, canApply: true });
+    assert.deepStrictEqual(updater.apply(), { ok: false, reason: 'no-verified-update' });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const APPLY_LOG_HEADER = '2026-10-27T03:00:00.0000000-05:00';
+function applyLogLines(...steps) {
+  return steps.map((s) => `${APPLY_LOG_HEADER} ${s}`).join('\r\n') + '\r\n';
+}
+
+test('0.5.2 apply log parsing: success counts only when the logged version is what runs now', () => {
+  const success = applyLogLines(
+    'started version=0.5.2 pid=4242',
+    'waited-pid-gone',
+    'copy-ok attempts=3',
+    'relaunch-issued',
+    'done result=success version=0.5.2',
+  );
+  assert.deepStrictEqual(parseApplyLog(success, '0.5.2'), { result: 'success', version: '0.5.2' });
+  assert.strictEqual(parseApplyLog(success, '0.5.3'), null, 'a past success is stale news on a newer build');
+  assert.strictEqual(parseApplyLog(success, '0.5.1'), null, '...and on an older one (manual revert)');
+});
+
+test('0.5.2 apply log parsing: failed counts only while the failed version is still ahead', () => {
+  const failed = applyLogLines(
+    'started version=0.5.2 pid=4242',
+    'waited-pid-gone',
+    'copy-attempt-failed attempt=1 error=The process cannot access the file',
+    'copy-failed attempts=120',
+    'relaunch-issued',
+    'done result=failed version=0.5.2',
+  );
+  assert.deepStrictEqual(parseApplyLog(failed, '0.5.1'), { result: 'failed', version: '0.5.2' });
+  assert.strictEqual(parseApplyLog(failed, '0.5.2'), null, 'already on the version (manual install) — no failure to report');
+  const stalled = applyLogLines('started version=0.5.2 pid=4242', 'copy-failed attempts=120');
+  assert.deepStrictEqual(
+    parseApplyLog(stalled, '0.5.1'),
+    { result: 'failed', version: '0.5.2' },
+    'copy-failed without a done line still reads as failed',
+  );
+});
+
+test('0.5.2 apply log parsing: a started-only run is unknown (the 0.5.1 failure shape)', () => {
+  const killed = applyLogLines('started version=0.5.1 pid=4242');
+  assert.deepStrictEqual(parseApplyLog(killed, '0.5.0'), { result: 'unknown', version: '0.5.1' });
+  const killedMidCopy = applyLogLines(
+    'started version=0.5.3 pid=4242',
+    'waited-pid-gone',
+    'copy-attempt-failed attempt=1 error=locked',
+  );
+  assert.deepStrictEqual(parseApplyLog(killedMidCopy, '0.5.2'), { result: 'unknown', version: '0.5.3' });
+  assert.strictEqual(parseApplyLog(killed, '0.5.2'), null, 'an ancient killed run is stale once we are past its version');
+});
+
+test('0.5.2 apply log parsing: last run wins; garbage and truncation never throw', () => {
+  const twoRuns =
+    applyLogLines('started version=0.5.1 pid=1', 'copy-ok attempts=1', 'done result=success version=0.5.1') +
+    applyLogLines('started version=0.5.2 pid=2', 'copy-failed attempts=120', 'done result=failed version=0.5.2');
+  assert.deepStrictEqual(parseApplyLog(twoRuns, '0.5.1'), { result: 'failed', version: '0.5.2' }, 'the second run decides');
+  assert.strictEqual(parseApplyLog('', '0.5.2'), null);
+  assert.strictEqual(parseApplyLog(null, '0.5.2'), null);
+  assert.strictEqual(parseApplyLog('not a log at all\n???\n', '0.5.2'), null);
+  assert.deepStrictEqual(
+    parseApplyLog('2026-10-27T03:00:00 started version=0.5.2 pid=4242\npartial line, no end', '0.5.1'),
+    { result: 'unknown', version: '0.5.2' },
+    'a log truncated mid-run parses as unknown, not a crash',
+  );
+});
+
+test('0.5.2 apply outcome: getLastApplyOutcome reads the log; cleanup keeps the log, removes the script', () => {
+  const root = updaterTmpRoot('outcome');
+  try {
+    const updatesDir = path.join(root, 'updates');
+    fs.mkdirSync(updatesDir, { recursive: true });
+    const logPath = path.join(updatesDir, APPLY_LOG_NAME);
+    fs.writeFileSync(
+      logPath,
+      applyLogLines('started version=0.5.3 pid=7', 'copy-ok attempts=2', 'done result=success version=0.5.3'),
+    );
+    const scriptPath = path.join(updatesDir, 'apply-update.ps1');
+    fs.writeFileSync(scriptPath, 'leftover');
+
+    const updater = createUpdater({ currentVersion: '0.5.3', userDataPath: root });
+    const outcome = updater.getLastApplyOutcome();
+    assert.deepStrictEqual(outcome, { result: 'success', version: '0.5.3', logPath });
+    assert.strictEqual(updater.getState().lastApplyOutcome.result, 'success', 'the outcome rides the state the settings row reads');
+
+    updater.cleanupStaleArtifacts();
+    assert.strictEqual(fs.existsSync(scriptPath), false, 'the stale script is removed');
+    assert.strictEqual(fs.existsSync(logPath), true, 'the apply log is NOT removed — it is the diagnostic record');
+    assert.strictEqual(updater.getLastApplyOutcome().result, 'success', 'the outcome is still readable after cleanup');
+
+    const bareRoot = updaterTmpRoot('outcome-bare');
+    try {
+      const bare = createUpdater({ currentVersion: '0.5.2', userDataPath: bareRoot });
+      assert.strictEqual(bare.getLastApplyOutcome(), null, 'no log → no outcome');
+    } finally {
+      fs.rmSync(bareRoot, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.2 apply outcome label: one line, or silence', () => {
+  assert.strictEqual(applyOutcomeLabel({ result: 'success', version: '0.5.2' }), 'Updated to 0.5.2');
+  assert.strictEqual(applyOutcomeLabel({ result: 'failed', version: '0.5.2' }), 'Update failed');
+  assert.strictEqual(applyOutcomeLabel({ result: 'unknown', version: '0.5.2' }), '');
+  assert.strictEqual(applyOutcomeLabel(null), '');
+  assert.strictEqual(applyOutcomeLabel(undefined), '');
+});
+
+test('0.5.2 activity: the apply-start audit entry renders as a plain line', () => {
+  const lines = formatActivity([
+    { ts: '2026-10-27T03:00:00.000Z', event: 'update_apply_started', version: '0.5.2', decision: 'update-apply', outcome: 'started' },
+  ]);
+  assert.strictEqual(lines.length, 1);
+  assert.strictEqual(lines[0].summary, 'Update apply started: 0.5.2');
+  assert.strictEqual(lines[0].outcome, 'started');
 });
 
 // --- 0.5.1: screen.capture -------------------------------------------------

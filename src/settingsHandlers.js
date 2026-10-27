@@ -6,13 +6,19 @@
 
 const { dialog, app } = require('electron');
 const fs = require('fs');
+const { applyOutcomeLabel } = require('./updater');
 const { getStorageInfo, destinationForParent, normalizeSubfolders } = require('./assistantFolder');
 const { saveSettings } = require('./settings');
 const { precheckMove, moveAssistantFolder, listRemains, appendMoveLog } = require('./moveFolder');
 
 function registerSettingsHandlers(ipcMain, context) {
   // One-line updater status for the settings window (0.5.0). The full
-  // state lives in updater.js; only the label crosses IPC.
+  // state lives in updater.js; only the label crosses IPC. Before
+  // any check runs this session (and whenever the check state has
+  // nothing fresher to say), the row reports the last apply's
+  // outcome from apply-update.log (0.5.2): "Updated to <version>"
+  // after a successful swap into this build, "Update failed" when
+  // the last apply fell short of a version still ahead of us.
   const updateStatus = () => {
     const s = typeof context.getUpdateState === 'function' ? context.getUpdateState() : null;
     if (!s) return '';
@@ -26,7 +32,7 @@ function registerSettingsHandlers(ipcMain, context) {
       case 'error':
         return 'Check failed';
       default:
-        return '';
+        return applyOutcomeLabel(s.lastApplyOutcome);
     }
   };
 
