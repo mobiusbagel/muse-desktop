@@ -11,6 +11,27 @@ const { getStorageInfo, destinationForParent, normalizeSubfolders } = require('.
 const { saveSettings } = require('./settings');
 const { precheckMove, moveAssistantFolder, listRemains, appendMoveLog } = require('./moveFolder');
 
+// THE remote-access settings path (0.3.0; shared since 0.5.4): flip
+// bridgeRemoteAccess in settings.json, persist, and rebind the
+// bridge listeners live via main's applyBridgeAccess (loopback
+// always; Tailscale IPv4 added when on). The settings-window toggle
+// and the tray menu's Remote Access checkbox both run exactly this
+// — there is no second implementation to drift.
+async function setRemoteAccess(context, enabled) {
+  context.settings.bridgeRemoteAccess = !!enabled;
+  saveSettings(context.userDataPath, context.settings);
+  console.log(`[settings] bridgeRemoteAccess set to ${context.settings.bridgeRemoteAccess}`);
+  if (typeof context.applyBridgeAccess === 'function') {
+    await context.applyBridgeAccess();
+  }
+  // The tray menu renders the setting (checkbox) and the bridge
+  // status line; both just changed. Guarded: main installs the hook
+  // once the tray exists.
+  if (typeof context.refreshTrayMenu === 'function') {
+    context.refreshTrayMenu();
+  }
+}
+
 function registerSettingsHandlers(ipcMain, context) {
   // One-line updater status for the settings window (0.5.0). The full
   // state lives in updater.js; only the label crosses IPC. Before
@@ -50,16 +71,10 @@ function registerSettingsHandlers(ipcMain, context) {
 
   ipcMain.handle('settings:get-state', () => currentState());
 
-  // Remote access toggle (0.3.0): flips bridgeRemoteAccess in
-  // settings.json, then rebinds the bridge listeners live via main's
-  // applyBridgeAccess (loopback always; Tailscale IPv4 added when on).
+  // Remote access toggle (0.3.0): the shared settings path (see
+  // setRemoteAccess above — the tray checkbox runs the same code).
   ipcMain.handle('settings:set-remote-access', async (_event, enabled) => {
-    context.settings.bridgeRemoteAccess = !!enabled;
-    saveSettings(context.userDataPath, context.settings);
-    console.log(`[settings] bridgeRemoteAccess set to ${context.settings.bridgeRemoteAccess}`);
-    if (typeof context.applyBridgeAccess === 'function') {
-      await context.applyBridgeAccess();
-    }
+    await setRemoteAccess(context, enabled);
     return currentState();
   });
 
@@ -211,4 +226,4 @@ function registerSettingsHandlers(ipcMain, context) {
   });
 }
 
-module.exports = { registerSettingsHandlers };
+module.exports = { registerSettingsHandlers, setRemoteAccess };

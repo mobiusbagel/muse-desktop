@@ -9,12 +9,15 @@ const WindowState = require('./windowState');
 
 const MUSE_URL = 'https://muse.ai';
 
-function createMainWindow(userDataPath) {
+function createMainWindow(userDataPath, { show = true } = {}) {
   const state = new WindowState(path.join(userDataPath, 'window-state.json'));
   state.sanitizePosition(screen.getAllDisplays().map((d) => d.bounds));
 
   const win = new BrowserWindow({
     ...state.bounds,
+    // `show: false` is the Jump List task launch (0.5.4): the app
+    // starts tray-resident and only the task's surface appears.
+    show,
     minWidth: 800,
     minHeight: 600,
     title: 'Muse',

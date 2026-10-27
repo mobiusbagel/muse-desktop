@@ -12,9 +12,20 @@ on your PC, and a plain-language audit log of everything that happened.
 
 ## Features
 
-- **Tray resident:** closing the window hides it to the tray; the tray
-  menu offers Show/Hide, **Assistant Folder & Storage…**,
-  **Bridge Activity…**, **Check for Updates…**, and Quit.
+- **Tray resident:** closing the window hides it to the tray. The tray
+  menu is the running app's cockpit: two status lines (the version,
+  and the bridge status in the same words the settings window uses),
+  a **Show Muse / Hide Muse** toggle that always labels the action
+  it will take, a **Remote Access** checkbox mirroring the settings
+  toggle, a state-aware updates item (**Check for Updates…** →
+  **Checking…** → **Restart to Update to \<version\>…**),
+  **Restart Muse**, and Quit.
+- **Jump List launcher:** right-clicking the app's taskbar icon offers
+  three destinations — **Open Assistant Folder**,
+  **Assistant Folder & Storage…**, and **Bridge Activity…** — which
+  work cold (the app starts straight at the destination) and route to
+  the running instance when the app is already open. Nothing is
+  duplicated between the tray menu and the Jump List.
 - **Global hotkey:** `Ctrl+Alt+M` shows/hides the window from anywhere.
   Single instance: launching again just focuses the running app.
 - **Assistant folder:** Muse's home turf on your PC — a folder named
@@ -35,9 +46,9 @@ on your PC, and a plain-language audit log of everything that happened.
   exact command, every time. (`screen.capture` is a standard
   capability: its prompt shows a one-line summary and offers
   always-allow.)
-- **Bridge Activity:** a tray-opened window rendering the audit log in
-  plain language, newest first — what ran, what was allowed or refused,
-  and why.
+- **Bridge Activity:** a window (opened from the taskbar Jump List)
+  rendering the audit log in plain language, newest first — what ran,
+  what was allowed or refused, and why.
 - **Remote access (optional, off by default):** the bridge can also
   listen on your machine's Tailscale address — never a LAN or public
   address — with the same token and permission gates.

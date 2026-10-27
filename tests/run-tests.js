@@ -37,6 +37,17 @@
 // fake capturer (downscale math, display selection, out-of-range /
 // no-screens errors), the moving-state refusal, and an audit summary
 // that carries dimensions but never image data.
+// 0.5.4 coverage: tray menu v2 under the zero-overlap split (the
+// pure template — cockpit only: disabled status lines reusing the
+// settings bridge wording, truthful Show/Hide label, Remote Access
+// checkbox mirroring the setting and reporting through the one
+// shared settings path, the updates item in idle/checking/ready/
+// error incl. ready routing to the prompt flow; the three
+// destination items asserted ABSENT), Windows Jump List tasks
+// (exactly three destinations, check-updates asserted absent, the
+// argv router, cold-start + second-instance wiring), and Restart
+// Muse (portable relaunches via WMI, WMI failure falls back to
+// relaunch, non-portable relaunches).
 // 0.5.3 coverage: screen.list (screenCapture.js + the rpc wiring) —
 // the list shape from a fake display provider (primary not first,
 // scaleFactor passthrough), index alignment with the capture source
@@ -91,7 +102,9 @@ const {
   DEFAULT_SETTINGS: SETTINGS_DEFAULTS,
   normalizeTrayLeftClick,
 } = require('../src/settings');
-const { trayLeftClickTarget } = require('../src/tray');
+const { trayLeftClickTarget, buildTrayMenuTemplate } = require('../src/tray');
+const { TASK_DEFINITIONS, buildUserTasks, parseTaskArg, routeTaskArg } = require('../src/jumpList');
+const { restartApp, exeCommandLine } = require('../src/restartApp');
 const {
   getStorageInfo,
   ensureAssistantFolder,
@@ -116,6 +129,7 @@ const {
   fingerprint256OfCertDer,
   buildSwapScript,
   buildWmiLaunchCommand,
+  buildWmiCreateCommand,
   parseApplyLog,
   applyOutcomeLabel,
   APPLY_LOG_NAME,
@@ -2541,6 +2555,239 @@ test('0.5.3 tray: the settings-window wiring (handler, preload, page, renderer)'
     renderer.includes("$('trayLeftClickSelect').value = state.trayLeftClick"),
     'render() reflects the saved value into the control',
   );
+});
+
+// --- 0.5.4: tray menu v2 + Jump List tasks + Restart Muse -------------------
+
+function trayMenuStateFixture(overrides = {}) {
+  return {
+    version: '0.5.4',
+    bridgeStatusLabel: 'Bridge: this PC only',
+    windowVisible: true,
+    remoteAccess: false,
+    updateState: 'idle',
+    pendingVersion: null,
+    ...overrides,
+  };
+}
+
+function trayActionsFixture() {
+  const calls = [];
+  const record = (name) => () => calls.push(name);
+  return {
+    calls,
+    onToggle: record('toggle'),
+    onOpenSettings: record('settings'),
+    onOpenAssistantFolder: record('open-folder'),
+    onOpenActivity: record('activity'),
+    onToggleRemoteAccess: (value) => calls.push(['remote', value]),
+    onCheckForUpdates: record('check'),
+    onRestartUpdate: record('restart-update'),
+    onRestart: record('restart'),
+    onQuit: record('quit'),
+  };
+}
+
+const menuLabels = (template) => template.map((item) => (item.type === 'separator' ? '|' : item.label));
+
+test('0.5.4 tray menu: cockpit-only order, disabled status lines, click wiring, destinations absent', () => {
+  const actions = trayActionsFixture();
+  const t = buildTrayMenuTemplate(trayMenuStateFixture(), actions);
+  assert.deepStrictEqual(menuLabels(t), [
+    'Muse 0.5.4',
+    'Bridge: this PC only',
+    '|',
+    'Hide Muse',
+    'Remote Access',
+    '|',
+    'Check for Updates…',
+    'Restart Muse',
+    'Quit',
+  ]);
+  // The zero-overlap split: destinations live on the Jump List only.
+  for (const destination of ['Assistant Folder & Storage…', 'Open Assistant Folder', 'Bridge Activity…']) {
+    assert.ok(!menuLabels(t).includes(destination), `the tray menu has no “${destination}” item`);
+  }
+  assert.strictEqual(t[0].enabled, false, 'the version line is a status line, not a button');
+  assert.strictEqual(t[1].enabled, false, 'the bridge line is a status line, not a button');
+  // The bridge line is whatever the shared status logic produced —
+  // passed through verbatim (settings wording, Tailscale address form).
+  const ts = buildTrayMenuTemplate(
+    trayMenuStateFixture({ bridgeStatusLabel: 'Bridge: Tailscale — 100.64.0.5:47631' }),
+    actions,
+  );
+  assert.strictEqual(ts[1].label, 'Bridge: Tailscale — 100.64.0.5:47631');
+  t[3].click();
+  t[7].click();
+  t[8].click();
+  assert.deepStrictEqual(actions.calls, ['toggle', 'restart', 'quit']);
+});
+
+test('0.5.4 tray menu: the toggle label flips with window visibility', () => {
+  const actions = trayActionsFixture();
+  assert.strictEqual(buildTrayMenuTemplate(trayMenuStateFixture({ windowVisible: true }), actions)[3].label, 'Hide Muse');
+  assert.strictEqual(buildTrayMenuTemplate(trayMenuStateFixture({ windowVisible: false }), actions)[3].label, 'Show Muse');
+});
+
+test('0.5.4 tray menu: Remote Access checkbox mirrors the setting and passes the new state through', () => {
+  const actions = trayActionsFixture();
+  const off = buildTrayMenuTemplate(trayMenuStateFixture({ remoteAccess: false }), actions)[4];
+  assert.strictEqual(off.type, 'checkbox');
+  assert.strictEqual(off.checked, false);
+  const on = buildTrayMenuTemplate(trayMenuStateFixture({ remoteAccess: true }), actions)[4];
+  assert.strictEqual(on.checked, true);
+  // Electron flips `checked` before the click fires; the template
+  // handler forwards exactly that new state to the settings path.
+  on.click({ checked: false });
+  off.click({ checked: true });
+  assert.deepStrictEqual(actions.calls, [['remote', false], ['remote', true]]);
+});
+
+test('0.5.4 tray menu: the updates item across idle / checking / ready / error', () => {
+  const actions = trayActionsFixture();
+  const idle = buildTrayMenuTemplate(trayMenuStateFixture({ updateState: 'idle' }), actions)[6];
+  assert.strictEqual(idle.label, 'Check for Updates…');
+  idle.click();
+  const upToDate = buildTrayMenuTemplate(trayMenuStateFixture({ updateState: 'up-to-date' }), actions)[6];
+  assert.strictEqual(upToDate.label, 'Check for Updates…');
+  const failed = buildTrayMenuTemplate(trayMenuStateFixture({ updateState: 'error' }), actions)[6];
+  assert.strictEqual(failed.label, 'Check for Updates…', 'a failed check lands back on Check for Updates');
+  const checking = buildTrayMenuTemplate(trayMenuStateFixture({ updateState: 'checking' }), actions)[6];
+  assert.strictEqual(checking.label, 'Checking…');
+  assert.strictEqual(checking.enabled, false);
+  assert.strictEqual(checking.click, undefined, 'no action while a check runs');
+  const ready = buildTrayMenuTemplate(
+    trayMenuStateFixture({ updateState: 'ready', pendingVersion: '0.5.5' }),
+    actions,
+  )[6];
+  assert.strictEqual(ready.label, 'Restart to Update to 0.5.5…');
+  ready.click();
+  // The ready item routes to the prompt flow (onRestartUpdate) —
+  // never to a direct apply, which the action set does not contain.
+  assert.deepStrictEqual(actions.calls, ['check', 'restart-update']);
+});
+
+test('0.5.4 wiring: menu rebuild triggers and the shared settings path', () => {
+  const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
+  const main = read('src/main.js');
+  assert.ok(main.includes("win.on('show', () => refreshTrayMenu())"), 'rebuild when the window shows');
+  assert.ok(main.includes("win.on('hide', () => refreshTrayMenu())"), 'rebuild when the window hides');
+  assert.ok(main.includes('getMenuState: trayMenuState'), 'the tray builds from trayMenuState');
+  assert.ok(main.includes('currentBridgeStatus().label'), 'the menu bridge line reuses the settings status logic');
+  assert.ok(main.includes('setRemoteAccess(context, enabled)'), 'the tray checkbox runs the shared settings path');
+  assert.ok(main.includes('refreshTrayMenu();\n        showUpdatePrompt(info);'), 'rebuild when an update becomes ready');
+  const handlers = read('src/settingsHandlers.js');
+  assert.ok(handlers.includes('async function setRemoteAccess(context, enabled)'), 'one shared remote-access implementation exists');
+  assert.ok(handlers.includes('await setRemoteAccess(context, enabled);'), 'the settings-window toggle delegates to it');
+  assert.ok(handlers.includes('context.refreshTrayMenu()'), 'the shared path refreshes the tray menu after a toggle');
+});
+
+test('0.5.4 jump list: exactly three task definitions — titles, --task args, exe icon; no check-updates', () => {
+  const exe = 'C:\\Tools\\Muse\\Muse-Portable.exe';
+  const tasks = buildUserTasks(exe);
+  assert.strictEqual(TASK_DEFINITIONS.length, 3);
+  assert.strictEqual(tasks.length, 3);
+  assert.deepStrictEqual(
+    tasks.map((t) => t.title),
+    ['Open Assistant Folder', 'Assistant Folder & Storage…', 'Bridge Activity…'],
+  );
+  assert.deepStrictEqual(
+    tasks.map((t) => t.arguments),
+    ['--task=open-folder', '--task=settings', '--task=activity'],
+  );
+  // Update-checking belongs to the running app, not the launcher.
+  assert.ok(!TASK_DEFINITIONS.some((d) => d.task === 'check-updates'), 'no Check for Updates task');
+  assert.ok(!tasks.some((t) => t.title === 'Check for Updates…'), 'no Check for Updates title');
+  for (const t of tasks) {
+    assert.strictEqual(t.program, exe);
+    assert.strictEqual(t.iconPath, exe, 'the task borrows the exe icon');
+    assert.strictEqual(t.iconIndex, 0);
+  }
+});
+
+test('0.5.4 jump list: the argv router maps each task and ignores unknown/absent ones', () => {
+  const calls = [];
+  const actions = {
+    onOpenSettings: () => calls.push('settings'),
+    onOpenAssistantFolder: () => calls.push('open-folder'),
+    onOpenActivity: () => calls.push('activity'),
+    onCheckForUpdates: () => calls.push('check-updates'),
+  };
+  const exe = 'C:\\Tools\\Muse\\Muse-Portable.exe';
+  assert.strictEqual(routeTaskArg([exe, '--task=open-folder'], actions), 'open-folder');
+  assert.strictEqual(routeTaskArg([exe, '--task=settings'], actions), 'settings');
+  assert.strictEqual(routeTaskArg([exe, '--task=activity'], actions), 'activity');
+  assert.strictEqual(routeTaskArg([exe, '--task', 'settings'], actions), 'settings', 'the split form routes too');
+  assert.deepStrictEqual(calls, ['open-folder', 'settings', 'activity', 'settings']);
+  // No task / unknown task → null: the caller does its normal launch.
+  // check-updates is unknown on purpose — the removed task degrades
+  // to a plain launch, and its (no longer wired) action never fires.
+  assert.strictEqual(routeTaskArg([exe], actions), null);
+  assert.strictEqual(routeTaskArg([exe, '--task=check-updates'], actions), null);
+  assert.strictEqual(routeTaskArg([exe, '--task=bogus'], actions), null);
+  assert.strictEqual(routeTaskArg([exe, '--task='], actions), null);
+  assert.strictEqual(parseTaskArg('not-an-array'), null);
+  assert.strictEqual(calls.length, 4, 'unknown tasks fired nothing');
+});
+
+test('0.5.4 jump list: main registers the tasks and routes cold start + second-instance identically', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert.ok(main.includes('app.setUserTasks(buildUserTasks(exePath))'), 'tasks registered at startup');
+  assert.ok(main.includes('process.env.PORTABLE_EXECUTABLE_FILE || process.execPath'), 'icon/program = the portable exe when there is one');
+  assert.ok(main.includes('const startupTask = parseTaskArg(process.argv);'), 'cold start parses its own argv');
+  assert.ok(main.includes('{ show: !startupTask }'), 'a task launch creates the main window hidden');
+  assert.ok(main.includes('if (startupTask) routeTaskArg(process.argv, taskActions);'), 'cold start performs the task after startup');
+  assert.ok(main.includes('if (!routeTaskArg(argv, taskActions)) showWindow();'), 'second-instance routes its argv through the same router');
+});
+
+test('0.5.4 restart: a portable run relaunches the portable exe via WMI, then quits', () => {
+  const calls = [];
+  const result = restartApp({
+    portableExePath: 'E:\\Tools\\Muse Desktop\\Muse-Portable.exe',
+    launchViaWmi: (p) => calls.push(['wmi', p]),
+    relaunch: () => calls.push(['relaunch']),
+    quit: () => calls.push(['quit']),
+  });
+  assert.deepStrictEqual(calls, [['wmi', 'E:\\Tools\\Muse Desktop\\Muse-Portable.exe'], ['quit']]);
+  assert.strictEqual(result.via, 'wmi');
+});
+
+test('0.5.4 restart: a WMI failure falls back to relaunch before quitting', () => {
+  const calls = [];
+  const result = restartApp({
+    portableExePath: 'C:\\Muse\\Muse-Portable.exe',
+    launchViaWmi: () => {
+      calls.push(['wmi']);
+      throw new Error('WMI unavailable');
+    },
+    relaunch: () => calls.push(['relaunch']),
+    quit: () => calls.push(['quit']),
+  });
+  assert.deepStrictEqual(calls.map((c) => c[0]), ['wmi', 'relaunch', 'quit'], 'never left with a dead app');
+  assert.strictEqual(result.via, 'relaunch-fallback');
+});
+
+test('0.5.4 restart: a non-portable run uses relaunch only', () => {
+  const calls = [];
+  const result = restartApp({
+    portableExePath: null,
+    launchViaWmi: () => calls.push(['wmi']),
+    relaunch: () => calls.push(['relaunch']),
+    quit: () => calls.push(['quit']),
+  });
+  assert.deepStrictEqual(calls, [['relaunch'], ['quit']]);
+  assert.strictEqual(result.via, 'relaunch');
+});
+
+test('0.5.4 restart: the exe WMI command quotes the path; main wires Restart through restartApp', () => {
+  assert.strictEqual(exeCommandLine('E:\\Tools\\Muse Desktop\\Muse-Portable.exe'), '"E:\\Tools\\Muse Desktop\\Muse-Portable.exe"');
+  const cmd = buildWmiCreateCommand(exeCommandLine('E:\\Tools\\Muse Desktop\\Muse-Portable.exe'));
+  assert.ok(cmd.startsWith('$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create'), 'created via Win32_Process.Create');
+  assert.ok(cmd.includes("CommandLine = '\"E:\\Tools\\Muse Desktop\\Muse-Portable.exe\"'"), 'the quoted exe path rides as the WMI command line');
+  const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert.ok(main.includes('portableExePath: process.env.PORTABLE_EXECUTABLE_FILE || null'), 'portable runs target PORTABLE_EXECUTABLE_FILE');
+  assert.ok(main.includes('launchViaWmi: defaultLaunchExeViaWmi'), 'the WMI launcher is the default');
+  assert.ok(main.includes('onRestart: restartMuse'), 'the tray Restart item is wired');
 });
 
 // ---------------------------------------------------------------------------

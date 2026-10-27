@@ -459,33 +459,47 @@ function defaultSpawnSwapScript(scriptPath) {
   return child;
 }
 
-// The PowerShell -Command the app runs to ask WMI to create the
-// swap process. The inner command line double-quotes the script
-// path (it lives under %APPDATA% and the target path may contain
-// spaces — a real install's does); the whole inner
-// line is then single-quoted for the outer script via psQuote.
-function buildWmiLaunchCommand(scriptPath) {
-  const inner = `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${scriptPath}"`;
+// The PowerShell -Command that asks WMI (Win32_Process.Create) to
+// start an arbitrary command line, parented to the WMI service —
+// outside this app's process tree. Exits non-zero unless WMI
+// reports the process was created. The command line is
+// single-quoted for the outer script via psQuote.
+function buildWmiCreateCommand(commandLine) {
   return (
-    `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${psQuote(inner)} }; ` +
+    `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${psQuote(commandLine)} }; ` +
     'if ($null -eq $r -or $r.ReturnValue -ne 0) { exit 1 }'
   );
 }
 
-// Primary launcher: synchronously asks WMI to create the swap
-// process, so by the time this returns the request is fully issued
-// and the app may quit safely. Throws on any failure; apply()
-// catches and falls back to the direct spawn.
-function defaultLaunchSwapScript(scriptPath) {
+// The WMI launch command for the swap script. The inner command
+// line double-quotes the script path (it lives under %APPDATA% and
+// the target path may contain spaces — a real install's does).
+function buildWmiLaunchCommand(scriptPath) {
+  const inner = `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${scriptPath}"`;
+  return buildWmiCreateCommand(inner);
+}
+
+// Synchronously runs a WMI-create -Command via powershell.exe, so
+// by the time this returns the request is fully issued and the app
+// may quit safely. Throws on any failure.
+function defaultLaunchViaWmi(commandLine) {
   const result = spawnSync(
     'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', buildWmiLaunchCommand(scriptPath)],
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', buildWmiCreateCommand(commandLine)],
     { stdio: 'ignore', windowsHide: true, timeout: 30_000 },
   );
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    throw new Error(`WMI swap launch failed (exit ${result.status === null ? 'killed' : result.status})`);
+    throw new Error(`WMI launch failed (exit ${result.status === null ? 'killed' : result.status})`);
   }
+}
+
+// Primary swap launcher: the WMI request for the swap script.
+// Throws on any failure; apply() catches and falls back to the
+// direct spawn.
+function defaultLaunchSwapScript(scriptPath) {
+  const inner = `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${scriptPath}"`;
+  defaultLaunchViaWmi(inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +786,9 @@ module.exports = {
   verifyDownloadedUpdate,
   psQuote,
   buildSwapScript,
+  buildWmiCreateCommand,
   buildWmiLaunchCommand,
+  defaultLaunchViaWmi,
   defaultLaunchSwapScript,
   parseApplyLog,
   applyOutcomeLabel,

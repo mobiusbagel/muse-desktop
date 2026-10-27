@@ -4,11 +4,13 @@
 // (Phase 2).
 'use strict';
 
-const { app, globalShortcut, ipcMain, dialog, desktopCapturer, screen } = require('electron');
+const { app, globalShortcut, ipcMain, dialog, desktopCapturer, screen, shell } = require('electron');
 const os = require('os');
 const path = require('path');
 const { createMainWindow } = require('./mainWindow');
 const { createTray } = require('./tray');
+const { buildUserTasks, parseTaskArg, routeTaskArg } = require('./jumpList');
+const { restartApp, defaultLaunchExeViaWmi } = require('./restartApp');
 const { startBridgeSet, BRIDGE_PORT } = require('./bridge');
 const { getBridgeStatus } = require('./bridgeNetwork');
 const { probeTailscaleClient } = require('./tailscaleProbe');
@@ -17,7 +19,7 @@ const { ensureSettings, saveSettings } = require('./settings');
 const { ensureAssistantFolder, getStorageInfo, createAssistantFolderAt } = require('./assistantFolder');
 const { createSettingsWindow } = require('./settingsWindow');
 const { createActivityWindow, registerActivityHandlers } = require('./activityWindow');
-const { registerSettingsHandlers } = require('./settingsHandlers');
+const { registerSettingsHandlers, setRemoteAccess } = require('./settingsHandlers');
 const { ensureBridgeToken } = require('./bridgeAuth');
 const { createRpcHandler } = require('./rpc');
 const { createScreenCapture, createScreenList } = require('./screenCapture');
@@ -42,7 +44,7 @@ const HOTKEY = 'CommandOrControl+Alt+M'; // Ctrl+Alt+M on Windows
 let mainWindow = null;
 let settingsWindow = null;
 let activityWindow = null;
-let tray = null;
+let trayHandle = null;
 let bridgeSet = null;
 let bridgeDeps = null;
 let updater = null;
@@ -108,7 +110,17 @@ const context = {
   getBridgeStatus: () => currentBridgeStatus(),
   applyBridgeAccess: () => restartBridgeListeners(),
   getUpdateState: () => (updater ? updater.getState() : null),
-  checkForUpdates: () => (updater ? updater.check() : Promise.resolve(null)),
+  checkForUpdates: () =>
+    updater
+      ? updater.check().then((s) => {
+          refreshTrayMenu();
+          return s;
+        })
+      : Promise.resolve(null),
+  // The shared remote-access path (settingsHandlers) calls this
+  // after a toggle so the tray menu's checkbox + status line stay
+  // true no matter which surface flipped the setting.
+  refreshTrayMenu: () => refreshTrayMenu(),
 };
 
 function openSettingsWindow() {
@@ -135,6 +147,95 @@ function openActivityWindow() {
   });
 }
 
+// --- Tray menu state (0.5.4) -------------------------------------------------
+// The tray menu is rebuilt from a fresh snapshot whenever anything
+// it renders changes: window show/hide (here in wireWindow), the
+// remote-access setting (either surface — the shared settings path
+// calls context.refreshTrayMenu), bridge rebinds, and updater
+// state transitions (check start/settle, ready).
+function trayMenuState() {
+  const s = updater ? updater.getState() : null;
+  return {
+    version: app.getVersion(),
+    bridgeStatusLabel: currentBridgeStatus().label,
+    windowVisible: !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()),
+    remoteAccess: !!(context.settings && context.settings.bridgeRemoteAccess),
+    updateState: s ? s.state : 'idle',
+    pendingVersion: s ? s.pendingVersion : null,
+  };
+}
+
+function refreshTrayMenu() {
+  if (trayHandle) trayHandle.refreshMenu();
+}
+
+// "Open Assistant Folder" (Jump List task): the folder root in
+// Explorer — Workspace and Shared live directly inside it.
+function openAssistantFolder() {
+  const folder = context.settings && context.settings.assistantFolder;
+  if (!folder) return;
+  shell.openPath(folder).then((error) => {
+    if (error) console.error('[shell] could not open the assistant folder:', error);
+  });
+}
+
+// The tray's updates item, idle family: run a check and keep the
+// menu honest while it runs (state reads 'checking' synchronously;
+// refresh again when it settles into ready/up-to-date/error).
+function trayCheckForUpdates() {
+  if (!updater) return;
+  const pending = updater.check();
+  refreshTrayMenu();
+  pending.then(
+    () => refreshTrayMenu(),
+    () => refreshTrayMenu(),
+  );
+}
+
+// The tray's updates item, ready state: the EXISTING ready prompt
+// (same dialog, same confirm semantics as the onReady flow) — the
+// menu item never applies an update by itself.
+function trayRestartToUpdate() {
+  if (!updater) return;
+  const s = updater.getState();
+  if (s.state === 'ready' && s.pendingVersion) {
+    showUpdatePrompt({ version: s.pendingVersion, canApply: s.canApply });
+  }
+}
+
+// The tray's Remote Access checkbox runs the one settings path
+// (settingsHandlers.setRemoteAccess — the settings window's toggle
+// is the same code, including persistence, live rebind, and the
+// tray-menu refresh at the end).
+function trayToggleRemoteAccess(enabled) {
+  setRemoteAccess(context, enabled).catch((err) => {
+    console.error('[settings] remote access toggle failed:', err.message);
+  });
+}
+
+// "Restart Muse": portable runs relaunch the portable exe via
+// WMI (outside the stub's process tree — see restartApp.js), other
+// runs via app.relaunch(); a WMI failure falls back to relaunch.
+// Either way this instance then quits through the normal path.
+function restartMuse() {
+  const { via } = restartApp({
+    portableExePath: process.env.PORTABLE_EXECUTABLE_FILE || null,
+    launchViaWmi: defaultLaunchExeViaWmi,
+    relaunch: () => app.relaunch(),
+    quit: quitApp,
+  });
+  console.log(`[restart] next instance launched via ${via}`);
+}
+
+// The Jump List tasks' destination callbacks (all hoisted
+// function declarations in this module). Since 0.5.4's split the
+// tray menu carries none of these — destinations are launcher-only.
+const taskActions = {
+  onOpenSettings: openSettingsWindow,
+  onOpenAssistantFolder: openAssistantFolder,
+  onOpenActivity: openActivityWindow,
+};
+
 function wireWindow(win) {
   // Closing the window hides it to the tray instead of quitting;
   // Quit lives in the tray menu.
@@ -144,6 +245,10 @@ function wireWindow(win) {
       win.hide();
     }
   });
+  // The tray menu's toggle item labels itself from the window's
+  // visibility — keep it true as the window comes and goes.
+  win.on('show', () => refreshTrayMenu());
+  win.on('hide', () => refreshTrayMenu());
   win.on('closed', () => {
     if (mainWindow === win) mainWindow = null;
   });
@@ -246,8 +351,11 @@ const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    showWindow();
+  app.on('second-instance', (_event, argv) => {
+    // A Jump List task launch arrives here as the second instance's
+    // argv (the lock keeps it from ever becoming its own instance):
+    // route the task; anything else is a plain re-launch → focus.
+    if (!routeTaskArg(argv, taskActions)) showWindow();
   });
 
   app.whenReady().then(async () => {
@@ -363,31 +471,58 @@ if (!gotSingleInstanceLock) {
       canApply: !!process.env.PORTABLE_EXECUTABLE_FILE,
       getCurrentExePath: () => process.env.PORTABLE_EXECUTABLE_FILE,
       audit: (entry) => appendAuditLog(userDataPath, entry),
-      onReady: (info) => showUpdatePrompt(info),
+      onReady: (info) => {
+        refreshTrayMenu();
+        showUpdatePrompt(info);
+      },
       onApplyStarted: () => quitApp(),
     });
     updater.cleanupStaleArtifacts();
     if (settings.autoCheckUpdates) {
       const launchCheckTimer = setTimeout(() => {
-        updater.check().catch(() => {});
+        updater
+          .check()
+          .catch(() => {})
+          .finally(() => refreshTrayMenu());
       }, 15_000);
       if (launchCheckTimer.unref) launchCheckTimer.unref();
     }
 
-    mainWindow = createMainWindow(app.getPath('userData'));
+    // A cold launch carrying a Jump List task (--task=…) starts
+    // tray-resident: the main window is created hidden and only
+    // the task's own surface appears (settings/activity windows;
+    // open-folder shows nothing of its own).
+    const startupTask = parseTaskArg(process.argv);
+    mainWindow = createMainWindow(app.getPath('userData'), { show: !startupTask });
     wireWindow(mainWindow);
 
-    tray = createTray({
+    trayHandle = createTray({
       onToggle: toggleWindow,
       onOpenSettings: openSettingsWindow,
       // 0.5.3: the tray left-click reads the live setting per click.
       getTrayLeftClick: () => context.settings.trayLeftClick,
-      onOpenActivity: openActivityWindow,
-      onCheckForUpdates: () => {
-        if (updater) updater.check().catch(() => {});
-      },
+      onToggleRemoteAccess: trayToggleRemoteAccess,
+      onCheckForUpdates: trayCheckForUpdates,
+      onRestartUpdate: trayRestartToUpdate,
+      onRestart: restartMuse,
       onQuit: quitApp,
+      getMenuState: trayMenuState,
     });
+
+    // Jump List tasks (Windows): the three destination commands
+    // ride the app icon's taskbar menu; each launches with
+    // --task=<name>, routed above on cold start and via
+    // second-instance afterwards. The tasks borrow the running
+    // exe's icon (the stamped logo).
+    if (process.platform === 'win32') {
+      const exePath = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+      try {
+        app.setUserTasks(buildUserTasks(exePath));
+      } catch (err) {
+        console.error('[jump-list] setUserTasks failed:', err.message);
+      }
+    }
+    if (startupTask) routeTaskArg(process.argv, taskActions);
 
     const hotkeyOk = globalShortcut.register(HOTKEY, toggleWindow);
     console.log(`[hotkey] ${HOTKEY} ${hotkeyOk ? 'registered' : 'FAILED to register'}`);
