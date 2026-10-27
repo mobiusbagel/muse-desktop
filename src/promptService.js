@@ -21,6 +21,10 @@ const { BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const { sanitizePromptAnswer } = require('./permissions');
 
+// If the prompt page cannot load and paint within this window, the ask
+// fails closed (denied) instead of leaving a blank window on screen.
+const LOAD_TIMEOUT_MS = 15_000;
+
 const PROMPT_PAGE = path.join(__dirname, 'prompt', 'index.html');
 const PROMPT_PRELOAD = path.join(__dirname, 'prompt', 'preload.js');
 
@@ -41,9 +45,15 @@ function createPermissionPromptService({ timeoutMs = 60_000 } = {}) {
   function showPrompt(request) {
     return new Promise((resolve) => {
       let settled = false;
+      let timer = null;
+      let loadTimer = null;
       const win = new BrowserWindow({
         width: 480,
         height: 380,
+        // Never display the window before its page has painted: showing
+        // first raced the load and could leave a blank white prompt on
+        // screen (seen live 2026-10-27, twice). Shown on ready-to-show.
+        show: false,
         resizable: false,
         minimizable: false,
         maximizable: false,
@@ -63,6 +73,7 @@ function createPermissionPromptService({ timeoutMs = 60_000 } = {}) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(loadTimer);
         if (current && current.request === request) current = null;
         if (!win.isDestroyed()) win.close();
         // Sanitized on the way out: for shell.run this strips any
@@ -71,21 +82,32 @@ function createPermissionPromptService({ timeoutMs = 60_000 } = {}) {
       };
       current = { request, finish };
 
-      const timer = setTimeout(() => finish({ allowed: false, timedOut: true }), timeoutMs);
+      // The answer clock starts when the prompt is actually visible —
+      // page-load time is not answer time.
+      win.once('ready-to-show', () => {
+        clearTimeout(loadTimer);
+        loadTimer = null;
+        win.show();
+        win.focus();
+        timer = setTimeout(() => finish({ allowed: false, timedOut: true }), timeoutMs);
+      });
+      // A page that fails to load, or never paints, denies the ask
+      // rather than stranding a blank window until the answer clock.
+      win.webContents.on('did-fail-load', () => finish({ allowed: false, timedOut: true }));
+      loadTimer = setTimeout(() => finish({ allowed: false, timedOut: true }), LOAD_TIMEOUT_MS);
 
       win.on('closed', () => {
         // Closing the window without answering is a denial.
         if (!settled) {
           settled = true;
           clearTimeout(timer);
+          clearTimeout(loadTimer);
           if (current && current.request === request) current = null;
           resolve(sanitizePromptAnswer(request.capability, { allowed: false }));
         }
       });
 
       win.loadFile(PROMPT_PAGE);
-      win.show();
-      win.focus();
     });
   }
 
