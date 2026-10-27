@@ -42,16 +42,16 @@
   "scripts": {
     "dist": "electron-builder --win nsis",
     "dist:portable": "electron-builder --win portable --prepackaged dist/win-unpacked",
-    "stamp": "node scripts/stamp-exe.js dist/win-unpacked/Muse.exe",
-    "verify:portable": "node scripts/verify-portable.js",
-    "sign:inner": "node scripts/sign-exe.js inner",
-    "sign:outer": "node scripts/sign-exe.js outer",
-    "sign": "node scripts/sign-exe.js",
-    "release": "npm run pack && npm run stamp && npm run sign:inner && npm run dist:portable && npm run verify:portable && npm run sign:outer",
     "icons": "python3 scripts/make-icons.py",
     "pack": "electron-builder --win --dir",
+    "release": "npm run pack && npm run stamp && npm run sign:inner && npm run dist:portable && npm run verify:portable && npm run sign:outer",
+    "sign": "node scripts/sign-exe.js",
+    "sign:inner": "node scripts/sign-exe.js inner",
+    "sign:outer": "node scripts/sign-exe.js outer",
+    "stamp": "node scripts/stamp-exe.js dist/win-unpacked/Muse.exe",
     "start": "electron .",
-    "test": "node tests/run-tests.js"
+    "test": "node tests/run-tests.js",
+    "verify:portable": "node scripts/verify-portable.js"
   },
-  "version": "0.5.7"
+  "version": "0.5.8"
 }

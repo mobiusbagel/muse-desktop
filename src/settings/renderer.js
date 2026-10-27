@@ -54,6 +54,9 @@ function render() {
   $('bridgeStatus').textContent = state.bridgeStatus || '';
   $('appVersionText').textContent = state.appVersion ? `Version ${state.appVersion}` : '';
   $('updateStatusText').textContent = state.updateStatus || '';
+  // The rollback control exists only while a confirmed backup does
+  // (0.5.8) — no version, no row.
+  $('restoreRow').classList.toggle('hidden', !state.backupVersion);
   $('autoCheckToggle').checked = !!state.autoCheckUpdates;
   $('checkUpdatesBtn').disabled = state.updateStatus === 'Checking…';
 }
@@ -91,6 +94,19 @@ $('checkUpdatesBtn').addEventListener('click', async () => {
     render();
   } catch (err) {
     setStatus(cleanErr(err), true);
+    await refresh();
+  }
+});
+
+$('restorePrevBtn').addEventListener('click', async () => {
+  try {
+    $('restorePrevBtn').disabled = true;
+    await window.museSettings.restorePrevious();
+    // On success the app quits to perform the swap; nothing further
+    // renders here.
+  } catch (err) {
+    setStatus(cleanErr(err), true);
+    $('restorePrevBtn').disabled = false;
     await refresh();
   }
 });

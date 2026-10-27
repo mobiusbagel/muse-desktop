@@ -57,6 +57,14 @@ function registerSettingsHandlers(ipcMain, context) {
     }
   };
 
+  // The confirmed rollback on offer (0.5.8): the backup version
+  // from the updater's state, or null — the settings window renders
+  // its Restore control only when this is non-null.
+  const backupVersion = () => {
+    const s = typeof context.getUpdateState === 'function' ? context.getUpdateState() : null;
+    return s && s.backup ? s.backup.version : null;
+  };
+
   const currentState = () => ({
     ...getStorageInfo(context.settings),
     moving: context.moving,
@@ -65,6 +73,7 @@ function registerSettingsHandlers(ipcMain, context) {
       typeof context.getBridgeStatus === 'function' ? context.getBridgeStatus().label : '',
     appVersion: app.getVersion(),
     updateStatus: updateStatus(),
+    backupVersion: backupVersion(),
     autoCheckUpdates: context.settings.autoCheckUpdates !== false,
   });
 
@@ -90,6 +99,25 @@ function registerSettingsHandlers(ipcMain, context) {
     context.settings.autoCheckUpdates = !!enabled;
     saveSettings(context.userDataPath, context.settings);
     console.log(`[settings] autoCheckUpdates set to ${context.settings.autoCheckUpdates}`);
+    return currentState();
+  });
+
+  // Restore previous version (0.5.8): the reverse swap. Offered only
+  // when a backup exists (backupVersion above); a refusal here is a
+  // one-line error. On success the updater's apply-started hook
+  // quits the app to perform the swap, exactly like a forward apply.
+  ipcMain.handle('settings:restore-previous', () => {
+    const result =
+      typeof context.restorePreviousUpdate === 'function'
+        ? context.restorePreviousUpdate()
+        : { ok: false, reason: 'no-backup' };
+    if (!result || !result.ok) {
+      throw new Error(
+        result && result.reason === 'not-portable'
+          ? 'Restore is only available from the portable build.'
+          : 'No previous version to restore.',
+      );
+    }
     return currentState();
   });
 

@@ -28,6 +28,19 @@
 // updates/apply-update.log, whose tail the app reads at boot to
 // report the last apply's outcome in the settings Updates row.
 //
+// 0.5.8 adds the safety net: before the swap replaces the portable
+// exe it copies the outgoing exe to Muse-Portable.previous.exe
+// beside it (one generation only), and the apply records a pending
+// marker the NEXT boot judges against the apply log — a successful
+// first launch of the new version turns it into last-update.json,
+// which is what the settings window's "Restore previous version"
+// control reads. Restore is the same swap run in reverse: the
+// backup becomes the live exe and is consumed, the version being
+// left is discarded (one generation, kept symmetric). Failure
+// discipline: a backup copy that cannot be made ABORTS the apply
+// inside the swap script (old exe relaunched, outcome logged as
+// result=aborted) — an update never proceeds without its rollback.
+//
 // Electron-free by design (same pattern as rpc.js): every outside
 // dependency — fetch, audit sink, the ready prompt, process spawn —
 // is injected, so the whole flow is unit-testable in plain Node.
@@ -53,6 +66,14 @@ const SUMS_ASSET_NAME = 'SHA256SUMS.txt';
 const USER_AGENT = 'Muse-Desktop-Updater';
 const SWAP_SCRIPT_NAME = 'apply-update.ps1';
 const APPLY_LOG_NAME = 'apply-update.log';
+// The rollback backup (0.5.8): the outgoing exe, preserved next to
+// the portable under this fixed name — one generation only.
+const BACKUP_EXE_NAME = 'Muse-Portable.previous.exe';
+// Marker files under userData/updates/: the pending record an
+// apply leaves for the next boot, and the confirmed record that
+// boot writes (see reconcileUpdateMarker).
+const PENDING_UPDATE_MARKER_NAME = 'last-update-pending.json';
+const LAST_UPDATE_MARKER_NAME = 'last-update.json';
 // Copy retries in the swap script: ~60 s at a 500 ms cadence. The
 // portable stub can hold the exe image briefly after the app exits,
 // so the copy has to out-wait it rather than give up in seconds.
@@ -412,12 +433,22 @@ function psQuote(value) {
 // app and nothing running — and appends a timestamped line per step
 // to the apply log. The downloaded copy is removed only on success;
 // on failure it stays, verified, for the next attempt.
-function buildSwapScript({ pid, currentExePath, newExePath, logPath, targetVersion }) {
+//
+// The safety net (0.5.8): when a backup path is given, the script
+// FIRST preserves the outgoing exe there (same retry budget — the
+// stub can hold the image against readers too). If the backup copy
+// cannot be made, the apply ABORTS before the live exe is touched:
+// old exe relaunched, `done result=aborted` logged. Restores run
+// the same script with no backup path: the source (the backup file
+// itself) is consumed by the success-branch removal below, and the
+// exe being left is discarded — one generation both ways.
+function buildSwapScript({ pid, currentExePath, newExePath, logPath, targetVersion, backupExePath = null }) {
   return [
     "$ErrorActionPreference = 'SilentlyContinue'",
     `$targetPid = ${Number(pid) || 0}`,
     `$newExe = ${psQuote(newExePath)}`,
     `$targetExe = ${psQuote(currentExePath)}`,
+    `$backupExe = ${psQuote(backupExePath || '')}`,
     `$logFile = ${psQuote(logPath || '')}`,
     `$targetVersion = ${psQuote(targetVersion || '')}`,
     'function Write-SwapLog([string]$step) {',
@@ -426,6 +457,26 @@ function buildSwapScript({ pid, currentExePath, newExePath, logPath, targetVersi
     "Write-SwapLog \"started version=$targetVersion pid=$targetPid\"",
     'if ($targetPid -gt 0) { Wait-Process -Id $targetPid -Timeout 60 -ErrorAction SilentlyContinue; Write-SwapLog \'waited-pid-gone\' }',
     'Start-Sleep -Milliseconds 400',
+    '$backupOk = $false',
+    'if ($backupExe) {',
+    '  $backupAttempts = 0',
+    `  for ($i = 0; $i -lt ${MAX_COPY_ATTEMPTS}; $i++) {`,
+    '    $backupAttempts = $i + 1',
+    '    try { Copy-Item -LiteralPath $targetExe -Destination $backupExe -Force -ErrorAction Stop; $backupOk = $true; break }',
+    '    catch { Write-SwapLog "backup-attempt-failed attempt=$backupAttempts error=$($_.Exception.Message)"; Start-Sleep -Milliseconds 500 }',
+    '  }',
+    '  if ($backupOk) { Write-SwapLog "backup-ok attempts=$backupAttempts" } else { Write-SwapLog "backup-failed attempts=$backupAttempts" }',
+    '} else {',
+    '  $backupOk = $true',
+    '}',
+    'if (-not $backupOk) {',
+    '  Write-SwapLog "aborted reason=backup-failed version=$targetVersion"',
+    '  Start-Process -FilePath $targetExe',
+    "  Write-SwapLog 'relaunch-issued'",
+    '  Write-SwapLog "done result=aborted version=$targetVersion"',
+    '  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue',
+    '  exit',
+    '}',
     '$copied = $false',
     '$attempts = 0',
     `for ($i = 0; $i -lt ${MAX_COPY_ATTEMPTS}; $i++) {`,
@@ -511,8 +562,9 @@ function defaultLaunchSwapScript(scriptPath) {
 //   { result: 'success', version } — that run copied `version` in,
 //     and `version` is what is running now.
 //   { result: 'failed', version } — that run ended without applying
-//     `version` (done/failed, or stalled at copy-failed), and
-//     `version` is still ahead of what's running: we're behind it.
+//     `version` (done/failed, a copy that never landed, or — 0.5.8 —
+//     done/aborted because the rollback backup could not be made),
+//     and `version` is still ahead of what's running: we're behind it.
 //   { result: 'unknown', version } — a run started but its outcome
 //     lines never landed (killed mid-flight — the 0.5.1 failure).
 //   null — no log, no recognizable run, or the last run's news is
@@ -532,17 +584,19 @@ function parseApplyLog(text, currentVersion) {
   if (startIdx < 0 || !version || !parseVersion(version)) return null;
   let done = null;
   let copyFailed = false;
+  let backupFailed = false;
   for (const line of lines.slice(startIdx + 1)) {
-    const d = / done result=(success|failed) version=(\S+)/.exec(line);
+    const d = / done result=(success|failed|aborted) version=(\S+)/.exec(line);
     if (d) done = { result: d[1], version: d[2] };
     if (/ copy-failed/.test(line)) copyFailed = true;
+    if (/ backup-failed attempts=/.test(line)) backupFailed = true;
   }
   if (done && done.result === 'success') {
     return compareVersions(done.version, currentVersion) === 0
       ? { result: 'success', version: done.version }
       : null;
   }
-  if ((done && done.result === 'failed') || copyFailed) {
+  if ((done && (done.result === 'failed' || done.result === 'aborted')) || copyFailed || backupFailed) {
     const target = done ? done.version : version;
     return isNewerVersion(target, currentVersion) ? { result: 'failed', version: target } : null;
   }
@@ -558,6 +612,100 @@ function applyOutcomeLabel(outcome) {
   if (outcome.result === 'success') return `Updated to ${outcome.version}`;
   if (outcome.result === 'failed') return 'Update failed';
   return '';
+}
+
+// ---------------------------------------------------------------------------
+// The rollback bookkeeping (0.5.8)
+// ---------------------------------------------------------------------------
+//
+// Two marker files under userData/updates/ carry the safety net's
+// memory across the swap:
+//
+//   last-update-pending.json — written by apply()/restorePrevious()
+//     BEFORE the swap launches: { from, to, restore }. It is a claim,
+//     not a fact — the swap may still fail or abort.
+//   last-update.json — written by the NEXT boot
+//     (reconcileUpdateMarker) once the apply log proves the swap
+//     into the pending `to` succeeded AND that version is what is
+//     running now: { from, to, backup, restore, at }. `backup` is
+//     the version Muse-Portable.previous.exe holds — the `from`
+//     version of an update, null after a restore (a restore
+//     consumes the backup and keeps no generation of its own).
+//
+// Restore is offered only from the confirmed marker, and only while
+// it describes the running build (marker.to === currentVersion), the
+// backup file is actually on disk, and the backup is strictly older
+// than what's running — a file of uncertain provenance is never
+// offered as a rollback. One generation: each new confirmed marker
+// replaces the old, and each apply overwrites the backup file.
+
+function backupPathFor(currentExePath) {
+  if (typeof currentExePath !== 'string' || !currentExePath) return null;
+  return path.join(path.dirname(currentExePath), BACKUP_EXE_NAME);
+}
+
+function buildPendingMarker({ fromVersion, toVersion, restore = false } = {}) {
+  if (!parseVersion(fromVersion || '') || !parseVersion(toVersion || '')) return null;
+  return { from: fromVersion, to: toVersion, restore: !!restore };
+}
+
+function parsePendingMarker(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== 'object') return null;
+  return buildPendingMarker({ fromVersion: obj.from, toVersion: obj.to, restore: obj.restore === true });
+}
+
+function buildLastUpdateMarker({
+  fromVersion,
+  toVersion,
+  backupVersion = null,
+  restore = false,
+  at = null,
+} = {}) {
+  if (!parseVersion(fromVersion || '') || !parseVersion(toVersion || '')) return null;
+  if (backupVersion !== null && !parseVersion(backupVersion)) return null;
+  return {
+    from: fromVersion,
+    to: toVersion,
+    backup: backupVersion,
+    restore: !!restore,
+    at: typeof at === 'string' && at ? at : new Date().toISOString(),
+  };
+}
+
+function parseLastUpdateMarker(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== 'object') return null;
+  return buildLastUpdateMarker({
+    fromVersion: obj.from,
+    toVersion: obj.to,
+    backupVersion: obj.backup ?? null,
+    restore: obj.restore === true,
+    at: obj.at,
+  });
+}
+
+// The pure restore-availability rule (see the section header):
+// { version, backupPath, fromVersion, appliedAt } or null.
+function backupInfoFromMarker(marker, currentVersion, backupPath, backupExists) {
+  if (!marker || !backupPath || !backupExists) return null;
+  if (!marker.backup) return null;
+  if (compareVersions(marker.to, currentVersion) !== 0) return null;
+  const cmp = compareVersions(marker.backup, currentVersion);
+  if (cmp === null || cmp >= 0) return null; // a rollback goes strictly back
+  return { version: marker.backup, backupPath, fromVersion: marker.from, appliedAt: marker.at };
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +752,7 @@ function createUpdater(deps) {
   let inFlight = null;
 
   function getState() {
-    return { ...state, currentVersion, canApply, lastApplyOutcome: getLastApplyOutcome() };
+    return { ...state, currentVersion, canApply, lastApplyOutcome: getLastApplyOutcome(), backup: getBackupInfo() };
   }
 
   // The last apply run's verdict from apply-update.log (0.5.2),
@@ -620,6 +768,70 @@ function createUpdater(deps) {
     }
     const outcome = parseApplyLog(text, currentVersion);
     return outcome ? { ...outcome, logPath } : null;
+  }
+
+  function readMarker(fileName, parse) {
+    try {
+      return parse(fs.readFileSync(path.join(updatesRoot, fileName), 'utf8'));
+    } catch {
+      return null;
+    }
+  }
+
+  // The confirmed rollback on offer, or null: the last-update
+  // marker, judged by backupInfoFromMarker, with the backup file
+  // confirmed on disk next to the running portable exe.
+  function getBackupInfo() {
+    const marker = readMarker(LAST_UPDATE_MARKER_NAME, parseLastUpdateMarker);
+    if (!marker) return null;
+    const backupPath = backupPathFor(getCurrentExePath());
+    let backupExists = false;
+    if (backupPath) {
+      try {
+        backupExists = fs.statSync(backupPath).isFile();
+      } catch {
+        backupExists = false;
+      }
+    }
+    return backupInfoFromMarker(marker, currentVersion, backupPath, backupExists);
+  }
+
+  // First-launch bookkeeping (0.5.8), called once at startup: judge
+  // the pending marker an apply left behind against the apply log.
+  //   success — the swap into pending.to landed and is running:
+  //     the confirmed marker replaces it (an update names its
+  //     `from` as the backup version; a restore names none).
+  //   failed / stale — the claim is consumed, no marker written.
+  //   unknown — a swap run may still be in flight (a boot raced
+  //     ahead of the swap script): the pending record is left for
+  //     the next boot to judge.
+  // Returns the confirmed marker, or null.
+  function reconcileUpdateMarker() {
+    const pending = readMarker(PENDING_UPDATE_MARKER_NAME, parsePendingMarker);
+    if (!pending) return null;
+    const outcome = getLastApplyOutcome();
+    if (outcome && outcome.result === 'unknown') return null;
+    try {
+      fs.rmSync(path.join(updatesRoot, PENDING_UPDATE_MARKER_NAME), { force: true });
+    } catch {
+      // best effort: a leftover pending record is re-judged next boot
+    }
+    if (!outcome || outcome.result !== 'success') return null;
+    if (compareVersions(pending.to, currentVersion) !== 0) return null;
+    const marker = buildLastUpdateMarker({
+      fromVersion: pending.from,
+      toVersion: pending.to,
+      backupVersion: pending.restore ? null : pending.from,
+      restore: pending.restore,
+    });
+    if (!marker) return null;
+    try {
+      fs.mkdirSync(updatesRoot, { recursive: true });
+      fs.writeFileSync(path.join(updatesRoot, LAST_UPDATE_MARKER_NAME), `${JSON.stringify(marker, null, 2)}\n`);
+    } catch {
+      return null;
+    }
+    return marker;
   }
 
   function versionDir(version) {
@@ -720,27 +932,31 @@ function createUpdater(deps) {
     return inFlight;
   }
 
-  // Applies the verified pending update. Only portable runs can
-  // replace their own exe; anything else is refused here (the UI
-  // disables the action with a one-line reason before this).
-  // The swap script is launched through WMI (0.5.2) so it survives
-  // the app/portable-stub teardown; if that launch errors, the old
-  // direct spawn is the fallback. Either way the launch path taken
-  // is audited before the app quits.
-  function apply() {
-    if (state.state !== 'ready' || !state.pendingExePath) {
-      return { ok: false, reason: 'no-verified-update' };
+  // Shared swap launcher for apply() and restorePrevious(): writes
+  // the pending marker FIRST (0.5.8 — a swap that cannot record its
+  // bookkeeping does not start), then the swap script, then launches
+  // it through WMI (0.5.2) so it survives the app/portable-stub
+  // teardown; if that launch errors, the old direct spawn is the
+  // fallback. Returns { ok, via } or a refusal.
+  function launchSwap({ newExePath, targetVersion, backupExePath = null, pending }) {
+    if (!pending) return { ok: false, reason: 'marker-write-failed' };
+    try {
+      fs.mkdirSync(updatesRoot, { recursive: true });
+      fs.writeFileSync(
+        path.join(updatesRoot, PENDING_UPDATE_MARKER_NAME),
+        `${JSON.stringify(pending, null, 2)}\n`,
+      );
+    } catch {
+      return { ok: false, reason: 'marker-write-failed' };
     }
-    if (!canApply) return { ok: false, reason: 'not-portable' };
-    const currentExePath = getCurrentExePath();
-    if (!currentExePath) return { ok: false, reason: 'not-portable' };
     const scriptPath = path.join(updatesRoot, SWAP_SCRIPT_NAME);
     const script = buildSwapScript({
       pid: getPid(),
-      currentExePath,
-      newExePath: state.pendingExePath,
+      currentExePath: getCurrentExePath(),
+      newExePath,
+      backupExePath,
       logPath: path.join(updatesRoot, APPLY_LOG_NAME),
-      targetVersion: state.pendingVersion,
+      targetVersion,
     });
     fs.writeFileSync(scriptPath, script);
     let via = 'wmi';
@@ -750,19 +966,80 @@ function createUpdater(deps) {
       via = 'spawn-fallback';
       spawnSwapScript(scriptPath);
     }
+    return { ok: true, via };
+  }
+
+  // Applies the verified pending update. Only portable runs can
+  // replace their own exe; anything else is refused here (the UI
+  // disables the action with a one-line reason before this). The
+  // swap preserves the outgoing exe as the rollback backup (the
+  // script aborts if that copy cannot be made).
+  function apply() {
+    if (state.state !== 'ready' || !state.pendingExePath) {
+      return { ok: false, reason: 'no-verified-update' };
+    }
+    if (!canApply) return { ok: false, reason: 'not-portable' };
+    const currentExePath = getCurrentExePath();
+    if (!currentExePath) return { ok: false, reason: 'not-portable' };
+    const launched = launchSwap({
+      newExePath: state.pendingExePath,
+      targetVersion: state.pendingVersion,
+      backupExePath: backupPathFor(currentExePath),
+      pending: buildPendingMarker({ fromVersion: currentVersion, toVersion: state.pendingVersion }),
+    });
+    if (!launched.ok) return launched;
     audit({
       ts: new Date().toISOString(),
       event: 'update_apply_started',
       version: state.pendingVersion,
       decision: 'update-apply',
       outcome: 'started',
-      via,
+      via: launched.via,
     });
     onApplyStarted();
     return { ok: true };
   }
 
-  return { check, apply, getState, getLastApplyOutcome, cleanupStaleArtifacts, updatesRoot };
+  // Rolls back to the preserved previous version (0.5.8): the same
+  // swap with the backup as the source and NO new backup — the
+  // backup file is consumed by the swap and the version being left
+  // is discarded, keeping the one-generation rule symmetric.
+  function restorePrevious() {
+    const info = getBackupInfo();
+    if (!info) return { ok: false, reason: 'no-backup' };
+    if (!canApply) return { ok: false, reason: 'not-portable' };
+    const currentExePath = getCurrentExePath();
+    if (!currentExePath) return { ok: false, reason: 'not-portable' };
+    const launched = launchSwap({
+      newExePath: info.backupPath,
+      targetVersion: info.version,
+      backupExePath: null,
+      pending: buildPendingMarker({ fromVersion: currentVersion, toVersion: info.version, restore: true }),
+    });
+    if (!launched.ok) return launched;
+    audit({
+      ts: new Date().toISOString(),
+      event: 'update_restore_started',
+      version: info.version,
+      decision: 'update-restore',
+      outcome: 'started',
+      via: launched.via,
+    });
+    onApplyStarted();
+    return { ok: true };
+  }
+
+  return {
+    check,
+    apply,
+    restorePrevious,
+    getState,
+    getLastApplyOutcome,
+    getBackupInfo,
+    reconcileUpdateMarker,
+    cleanupStaleArtifacts,
+    updatesRoot,
+  };
 }
 
 module.exports = {
@@ -793,6 +1070,15 @@ module.exports = {
   parseApplyLog,
   applyOutcomeLabel,
   APPLY_LOG_NAME,
+  BACKUP_EXE_NAME,
+  PENDING_UPDATE_MARKER_NAME,
+  LAST_UPDATE_MARKER_NAME,
+  backupPathFor,
+  buildPendingMarker,
+  parsePendingMarker,
+  buildLastUpdateMarker,
+  parseLastUpdateMarker,
+  backupInfoFromMarker,
   SWAP_SCRIPT_NAME,
   MAX_COPY_ATTEMPTS,
   defaultDownloadToFile,

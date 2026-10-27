@@ -68,6 +68,15 @@
 // the chord until did-finish-load, and the timeout path sends
 // nothing and logs). --task=muse-settings must not disturb
 // --task=settings (the app's own settings window).
+// 0.5.8 coverage: the update safety net (updater.js) — the swap
+// script's backup step (one generation, beside the portable, the
+// retry budget, abort-before-touch on backup failure, restores
+// carry no backup), the pending → confirmed marker flow (a first
+// launch judges the apply against the log; unknown verdicts leave
+// the claim for the next boot), restore-availability rules
+// (confirmed marker + on-disk backup + strictly older), restore
+// as the reverse swap (backup consumed, restore audit line), and
+// the settings-window wiring (Restore control only with a backup).
 // Run: npm test
 'use strict';
 
@@ -153,6 +162,15 @@ const {
   parseApplyLog,
   applyOutcomeLabel,
   APPLY_LOG_NAME,
+  BACKUP_EXE_NAME,
+  PENDING_UPDATE_MARKER_NAME,
+  LAST_UPDATE_MARKER_NAME,
+  backupPathFor,
+  buildPendingMarker,
+  parsePendingMarker,
+  buildLastUpdateMarker,
+  parseLastUpdateMarker,
+  backupInfoFromMarker,
   MAX_COPY_ATTEMPTS,
   psQuote,
   createUpdater,
@@ -1839,7 +1857,10 @@ test('0.5.2 swap script: every stage is logged and the target always relaunches'
   assert.ok(script.includes(`for ($i = 0; $i -lt ${MAX_COPY_ATTEMPTS}; $i++)`), 'the retry loop uses the shared attempt budget');
   assert.ok(MAX_COPY_ATTEMPTS >= 100, 'the copy window is ~60 s, not the old ~20 s');
   const copyFailedAt = script.indexOf('copy-failed attempts=');
-  const relaunchAt = script.indexOf('Start-Process -FilePath $targetExe');
+  // Anchor the search past the copy loop: since 0.5.8 an earlier
+  // Start-Process exists by design (the backup-failure abort
+  // relaunches the old exe before any copy is attempted).
+  const relaunchAt = script.indexOf('Start-Process -FilePath $targetExe', copyFailedAt);
   assert.ok(relaunchAt > copyFailedAt, 'Start-Process sits after the copy loop — it runs even when the copy failed');
   const removeDownloadAt = script.indexOf('Remove-Item -LiteralPath $newExe');
   assert.ok(removeDownloadAt > relaunchAt, 'the verified download is removed only after the relaunch');
@@ -2033,6 +2054,504 @@ test('0.5.2 activity: the apply-start audit entry renders as a plain line', () =
   assert.strictEqual(lines.length, 1);
   assert.strictEqual(lines[0].summary, 'Update apply started: 0.5.2');
   assert.strictEqual(lines[0].outcome, 'started');
+});
+
+// --- 0.5.8: the update safety net ------------------------------------------
+
+test('0.5.8 backup path: the fixed name beside the portable', () => {
+  assert.strictEqual(BACKUP_EXE_NAME, 'Muse-Portable.previous.exe');
+  assert.strictEqual(
+    backupPathFor('/portable/Muse-Portable.exe'),
+    '/portable/Muse-Portable.previous.exe',
+    'the backup lives in the portable exe\'s own folder',
+  );
+  assert.strictEqual(backupPathFor(''), null);
+  assert.strictEqual(backupPathFor(undefined), null);
+  assert.strictEqual(backupPathFor(null), null);
+});
+
+test('0.5.8 markers: pending and confirmed records round-trip; garbage is refused', () => {
+  assert.deepStrictEqual(buildPendingMarker({ fromVersion: '0.5.7', toVersion: '0.5.8' }), {
+    from: '0.5.7',
+    to: '0.5.8',
+    restore: false,
+  });
+  assert.strictEqual(buildPendingMarker({ fromVersion: 'x', toVersion: '0.5.8' }), null);
+  assert.deepStrictEqual(parsePendingMarker('{"from":"0.5.8","to":"0.5.7","restore":true}'), {
+    from: '0.5.8',
+    to: '0.5.7',
+    restore: true,
+  });
+  assert.strictEqual(parsePendingMarker('not json'), null);
+  assert.strictEqual(parsePendingMarker('{"from":"0.5.8"}'), null, 'a missing field is not a marker');
+  assert.strictEqual(parsePendingMarker(''), null);
+  assert.strictEqual(parsePendingMarker(null), null);
+  const marker = buildLastUpdateMarker({
+    fromVersion: '0.5.7',
+    toVersion: '0.5.8',
+    backupVersion: '0.5.7',
+    at: '2026-10-27T12:00:00.000Z',
+  });
+  assert.deepStrictEqual(parseLastUpdateMarker(JSON.stringify(marker)), marker, 'the confirmed marker round-trips');
+  assert.strictEqual(
+    buildLastUpdateMarker({ fromVersion: '0.5.7', toVersion: '0.5.8', backupVersion: 'nope' }),
+    null,
+    'an unparseable backup version is refused at build time',
+  );
+  assert.strictEqual(parseLastUpdateMarker('{"from":"0.5.7","to":"0.5.8","backup":42}'), null);
+  assert.strictEqual(parseLastUpdateMarker('[1,2]'), null);
+});
+
+test('0.5.8 restore availability: confirmed marker + on-disk backup + strictly older', () => {
+  const marker = { from: '0.5.7', to: '0.5.8', backup: '0.5.7', restore: false, at: '2026-10-27T12:00:00.000Z' };
+  const exe = '/p/Muse-Portable.previous.exe';
+  const info = backupInfoFromMarker(marker, '0.5.8', exe, true);
+  assert.strictEqual(info.version, '0.5.7');
+  assert.strictEqual(info.backupPath, exe);
+  assert.strictEqual(backupInfoFromMarker(marker, '0.5.8', exe, false), null, 'backup file gone → nothing offered');
+  assert.strictEqual(backupInfoFromMarker(marker, '0.5.9', exe, true), null, 'the marker describes another build → stale');
+  assert.strictEqual(
+    backupInfoFromMarker({ ...marker, backup: null }, '0.5.8', exe, true),
+    null,
+    'a post-restore marker offers nothing',
+  );
+  assert.strictEqual(
+    backupInfoFromMarker({ ...marker, backup: '0.5.8' }, '0.5.8', exe, true),
+    null,
+    'not strictly older → not a rollback',
+  );
+  assert.strictEqual(backupInfoFromMarker(null, '0.5.8', exe, true), null);
+  assert.strictEqual(backupInfoFromMarker(marker, '0.5.8', null, true), null);
+});
+
+test('0.5.8 swap script: the backup step runs first; an unmakeable backup aborts the apply', () => {
+  const script = buildSwapScript({
+    pid: 99,
+    currentExePath: 'E:\\Tools\\Muse Desktop\\Muse-Portable.exe',
+    newExePath: 'C:\\Users\\Some One\\AppData\\Roaming\\Muse\\updates\\0.5.8\\Muse-Portable.exe',
+    logPath: 'C:\\Users\\Some One\\AppData\\Roaming\\Muse\\updates\\apply-update.log',
+    targetVersion: '0.5.8',
+    backupExePath: 'E:\\Tools\\Muse Desktop\\Muse-Portable.previous.exe',
+  });
+  assert.ok(
+    script.includes("$backupExe = 'E:\\Tools\\Muse Desktop\\Muse-Portable.previous.exe'"),
+    'the backup path is the sibling previous-exe',
+  );
+  for (const step of [
+    'backup-attempt-failed attempt=$backupAttempts error=',
+    'backup-ok attempts=$backupAttempts',
+    'backup-failed attempts=$backupAttempts',
+    'aborted reason=backup-failed version=$targetVersion',
+    'done result=aborted version=$targetVersion',
+  ]) {
+    assert.ok(script.includes(step), `the script logs: ${step}`);
+  }
+  assert.ok(script.includes('if ($backupExe) {'), 'the backup step runs only when a backup path is given');
+  assert.strictEqual(
+    script.split(`-lt ${MAX_COPY_ATTEMPTS}`).length - 1,
+    2,
+    'the backup copy gets the same ~60 s retry budget as the live copy',
+  );
+  const backupCopyAt = script.indexOf('Copy-Item -LiteralPath $targetExe -Destination $backupExe');
+  const mainCopyAt = script.indexOf('Copy-Item -LiteralPath $newExe -Destination $targetExe');
+  assert.ok(backupCopyAt > -1 && mainCopyAt > backupCopyAt, 'the outgoing exe is preserved before it is replaced');
+  const abortAt = script.indexOf('if (-not $backupOk)');
+  assert.ok(abortAt > backupCopyAt && abortAt < mainCopyAt, 'the abort is decided before the live copy starts');
+  const abortRelaunchAt = script.indexOf('Start-Process -FilePath $targetExe', abortAt);
+  assert.ok(abortRelaunchAt > abortAt && abortRelaunchAt < mainCopyAt, 'the abort still relaunches the old exe');
+});
+
+test('0.5.8 swap script: no backup path → the backup step stands down (the restore shape)', () => {
+  const script = buildSwapScript({
+    pid: 99,
+    currentExePath: 'E:\\Tools\\Muse Desktop\\Muse-Portable.exe',
+    newExePath: 'E:\\Tools\\Muse Desktop\\Muse-Portable.previous.exe',
+    logPath: 'C:\\Users\\Some One\\AppData\\Roaming\\Muse\\updates\\apply-update.log',
+    targetVersion: '0.5.7',
+  });
+  assert.ok(script.includes("$backupExe = ''"), 'no backup path is recorded');
+  assert.ok(script.includes('$backupOk = $true'), 'the guard lets the swap proceed straight to the copy');
+  assert.ok(script.includes('done result=success version=$targetVersion'), 'the success tail is unchanged');
+});
+
+test('0.5.8 apply log parsing: an aborted apply reads as failed while its version is ahead', () => {
+  const aborted = applyLogLines(
+    'started version=0.5.8 pid=4242',
+    'waited-pid-gone',
+    'backup-attempt-failed attempt=1 error=The process cannot access the file',
+    'backup-failed attempts=120',
+    'aborted reason=backup-failed version=0.5.8',
+    'relaunch-issued',
+    'done result=aborted version=0.5.8',
+  );
+  assert.deepStrictEqual(parseApplyLog(aborted, '0.5.7'), { result: 'failed', version: '0.5.8' });
+  assert.strictEqual(applyOutcomeLabel(parseApplyLog(aborted, '0.5.7')), 'Update failed');
+  assert.strictEqual(parseApplyLog(aborted, '0.5.8'), null, 'already on the version — no failure to report');
+  const diedAfterBackup = applyLogLines('started version=0.5.8 pid=4242', 'backup-failed attempts=120');
+  assert.deepStrictEqual(
+    parseApplyLog(diedAfterBackup, '0.5.7'),
+    { result: 'failed', version: '0.5.8' },
+    'a run that died right after the backup failure still reads failed, not unknown',
+  );
+});
+
+test('0.5.8 apply: the swap preserves the outgoing exe; the next boot confirms the backup', async () => {
+  if (!haveUpdaterFixtures) {
+    console.log('     (skipped: signed dist fixture not present)');
+    return;
+  }
+  const root = updaterTmpRoot('flow-backup');
+  const audits = [];
+  let launchedScript = null;
+  let applyStarted = false;
+  try {
+    const fixtureHash = crypto.createHash('sha256').update(fs.readFileSync(SIGNED_EXE_FIXTURE)).digest('hex');
+    const liveExe = path.join(root, 'Muse-Portable.exe');
+    const updater = createUpdater({
+      currentVersion: '0.5.7',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => liveExe,
+      fetchImpl: jsonFetch(releaseJson('0.5.8')),
+      downloadToFile: stubDownload([
+        ['.exe', (dest) => fs.copyFileSync(SIGNED_EXE_FIXTURE, dest)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable.exe\n`)],
+      ]),
+      audit: (entry) => audits.push(entry),
+      launchSwapScript: (scriptPath) => {
+        launchedScript = scriptPath;
+      },
+      onApplyStarted: () => {
+        applyStarted = true;
+      },
+    });
+    const state = await updater.check();
+    assert.strictEqual(state.state, 'ready');
+    assert.strictEqual(state.backup, null, 'no backup before any confirmed update');
+    assert.deepStrictEqual(updater.apply(), { ok: true });
+    const backupPath = path.join(root, BACKUP_EXE_NAME);
+    const script = fs.readFileSync(launchedScript, 'utf8');
+    assert.ok(script.includes(`$backupExe = '${backupPath}'`), 'the swap is told to preserve the outgoing exe');
+    const pending = JSON.parse(
+      fs.readFileSync(path.join(root, 'updates', PENDING_UPDATE_MARKER_NAME), 'utf8'),
+    );
+    assert.deepStrictEqual(
+      pending,
+      { from: '0.5.7', to: '0.5.8', restore: false },
+      'the pending record is written before the swap launches',
+    );
+    assert.strictEqual(applyStarted, true);
+
+    // The swap ran: the backup file is on disk and the log records
+    // the backup step inside a successful run.
+    fs.writeFileSync(backupPath, 'the outgoing 0.5.7 exe');
+    fs.writeFileSync(
+      path.join(root, 'updates', APPLY_LOG_NAME),
+      applyLogLines(
+        'started version=0.5.8 pid=9',
+        'waited-pid-gone',
+        'backup-ok attempts=1',
+        'copy-ok attempts=1',
+        'relaunch-issued',
+        'done result=success version=0.5.8',
+      ),
+    );
+    const booted = createUpdater({
+      currentVersion: '0.5.8',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => liveExe,
+    });
+    const marker = booted.reconcileUpdateMarker();
+    assert.ok(marker && marker.backup === '0.5.7', 'the first launch of the new version confirms the update');
+    assert.strictEqual(
+      fs.existsSync(path.join(root, 'updates', PENDING_UPDATE_MARKER_NAME)),
+      false,
+      'the pending record is consumed',
+    );
+    const confirmed = JSON.parse(fs.readFileSync(path.join(root, 'updates', LAST_UPDATE_MARKER_NAME), 'utf8'));
+    assert.strictEqual(confirmed.from, '0.5.7');
+    assert.strictEqual(confirmed.to, '0.5.8');
+    assert.strictEqual(booted.getState().backup.version, '0.5.7', 'the settings state now offers the rollback');
+    assert.strictEqual(booted.getBackupInfo().backupPath, backupPath);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.8 apply: unwritable bookkeeping refuses the swap before it starts', async () => {
+  if (!haveUpdaterFixtures) {
+    console.log('     (skipped: signed dist fixture not present)');
+    return;
+  }
+  const root = updaterTmpRoot('flow-markerfail');
+  let launched = false;
+  let applyStarted = false;
+  try {
+    const fixtureHash = crypto.createHash('sha256').update(fs.readFileSync(SIGNED_EXE_FIXTURE)).digest('hex');
+    const updater = createUpdater({
+      currentVersion: '0.5.7',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => path.join(root, 'Muse-Portable.exe'),
+      fetchImpl: jsonFetch(releaseJson('0.5.8')),
+      downloadToFile: stubDownload([
+        ['.exe', (dest) => fs.copyFileSync(SIGNED_EXE_FIXTURE, dest)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Portable.exe\n`)],
+      ]),
+      launchSwapScript: () => {
+        launched = true;
+      },
+      onApplyStarted: () => {
+        applyStarted = true;
+      },
+    });
+    const state = await updater.check();
+    assert.strictEqual(state.state, 'ready');
+    // A directory squatting on the pending marker's path makes the
+    // bookkeeping write fail deterministically.
+    fs.mkdirSync(path.join(root, 'updates', PENDING_UPDATE_MARKER_NAME), { recursive: true });
+    assert.deepStrictEqual(updater.apply(), { ok: false, reason: 'marker-write-failed' });
+    assert.strictEqual(launched, false, 'no swap script is launched');
+    assert.strictEqual(applyStarted, false, 'the app is not told to quit');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.8 reconcile: a failed swap consumes the claim and confirms nothing', () => {
+  const root = updaterTmpRoot('reconcile-failed');
+  try {
+    const updatesDir = path.join(root, 'updates');
+    fs.mkdirSync(updatesDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(updatesDir, PENDING_UPDATE_MARKER_NAME),
+      JSON.stringify({ from: '0.5.7', to: '0.5.8', restore: false }),
+    );
+    fs.writeFileSync(
+      path.join(updatesDir, APPLY_LOG_NAME),
+      applyLogLines('started version=0.5.8 pid=1', 'copy-failed attempts=120', 'done result=failed version=0.5.8'),
+    );
+    const updater = createUpdater({
+      currentVersion: '0.5.7',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => path.join(root, 'Muse-Portable.exe'),
+    });
+    assert.strictEqual(updater.reconcileUpdateMarker(), null);
+    assert.strictEqual(
+      fs.existsSync(path.join(updatesDir, PENDING_UPDATE_MARKER_NAME)),
+      false,
+      'the judged claim is consumed',
+    );
+    assert.strictEqual(
+      fs.existsSync(path.join(updatesDir, LAST_UPDATE_MARKER_NAME)),
+      false,
+      'no marker for a swap that never landed',
+    );
+    assert.strictEqual(updater.getBackupInfo(), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.8 reconcile: an in-flight verdict leaves the claim for the next boot', () => {
+  const root = updaterTmpRoot('reconcile-unknown');
+  try {
+    const updatesDir = path.join(root, 'updates');
+    fs.mkdirSync(updatesDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(updatesDir, PENDING_UPDATE_MARKER_NAME),
+      JSON.stringify({ from: '0.5.7', to: '0.5.8', restore: false }),
+    );
+    // The 0.5.1 failure shape: a run that started and never wrote
+    // its outcome — it may still be mid-swap.
+    fs.writeFileSync(path.join(updatesDir, APPLY_LOG_NAME), applyLogLines('started version=0.5.8 pid=1'));
+    const updater = createUpdater({
+      currentVersion: '0.5.7',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => path.join(root, 'Muse-Portable.exe'),
+    });
+    assert.strictEqual(updater.reconcileUpdateMarker(), null);
+    assert.strictEqual(
+      fs.existsSync(path.join(updatesDir, PENDING_UPDATE_MARKER_NAME)),
+      true,
+      'an unjudged claim survives to the next boot',
+    );
+    assert.strictEqual(fs.existsSync(path.join(updatesDir, LAST_UPDATE_MARKER_NAME)), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.8 reconcile: one generation — the next confirmed update replaces the record', () => {
+  const root = updaterTmpRoot('reconcile-generations');
+  try {
+    const updatesDir = path.join(root, 'updates');
+    fs.mkdirSync(updatesDir, { recursive: true });
+    const liveExe = path.join(root, 'Muse-Portable.exe');
+    fs.writeFileSync(path.join(root, BACKUP_EXE_NAME), 'the outgoing 0.5.8 exe');
+    fs.writeFileSync(
+      path.join(updatesDir, LAST_UPDATE_MARKER_NAME),
+      JSON.stringify({ from: '0.5.7', to: '0.5.8', backup: '0.5.7', restore: false, at: '2026-10-27T00:00:00.000Z' }),
+    );
+    fs.writeFileSync(
+      path.join(updatesDir, PENDING_UPDATE_MARKER_NAME),
+      JSON.stringify({ from: '0.5.8', to: '0.5.9', restore: false }),
+    );
+    fs.writeFileSync(
+      path.join(updatesDir, APPLY_LOG_NAME),
+      applyLogLines('started version=0.5.9 pid=2', 'backup-ok attempts=1', 'copy-ok attempts=1', 'done result=success version=0.5.9'),
+    );
+    const updater = createUpdater({
+      currentVersion: '0.5.9',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => liveExe,
+    });
+    const marker = updater.reconcileUpdateMarker();
+    assert.strictEqual(marker.backup, '0.5.8', 'the record now names the newer backup');
+    assert.strictEqual(updater.getBackupInfo().version, '0.5.8', 'the rollback follows the newest generation');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.8 restore: the reverse swap consumes the backup and confirms with none of its own', () => {
+  const root = updaterTmpRoot('restore');
+  try {
+    const updatesDir = path.join(root, 'updates');
+    fs.mkdirSync(updatesDir, { recursive: true });
+    const liveExe = path.join(root, 'Muse-Portable.exe');
+    fs.writeFileSync(liveExe, 'the running 0.5.8 exe');
+    const backupPath = path.join(root, BACKUP_EXE_NAME);
+    fs.writeFileSync(backupPath, 'the preserved 0.5.7 exe');
+    fs.writeFileSync(
+      path.join(updatesDir, LAST_UPDATE_MARKER_NAME),
+      JSON.stringify({ from: '0.5.7', to: '0.5.8', backup: '0.5.7', restore: false, at: '2026-10-27T00:00:00.000Z' }),
+    );
+    const audits = [];
+    let launchedScript = null;
+    let applyStarted = false;
+    const updater = createUpdater({
+      currentVersion: '0.5.8',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => liveExe,
+      audit: (entry) => audits.push(entry),
+      launchSwapScript: (scriptPath) => {
+        launchedScript = scriptPath;
+      },
+      onApplyStarted: () => {
+        applyStarted = true;
+      },
+    });
+    assert.strictEqual(updater.getBackupInfo().version, '0.5.7');
+    assert.deepStrictEqual(updater.restorePrevious(), { ok: true });
+    const script = fs.readFileSync(launchedScript, 'utf8');
+    assert.ok(script.includes(`$newExe = '${backupPath}'`), 'the backup is the swap source');
+    assert.ok(script.includes("$backupExe = ''"), 'a restore makes no new backup — the version left behind is discarded');
+    const pending = JSON.parse(fs.readFileSync(path.join(updatesDir, PENDING_UPDATE_MARKER_NAME), 'utf8'));
+    assert.deepStrictEqual(pending, { from: '0.5.8', to: '0.5.7', restore: true });
+    const audit = audits.find((a) => a.event === 'update_restore_started');
+    assert.ok(audit && audit.version === '0.5.7' && audit.decision === 'update-restore', 'the restore is audited');
+    assert.strictEqual(applyStarted, true, 'the app quits to perform the swap, like a forward apply');
+
+    // The restored boot: the swap consumed the backup file and the
+    // log records the reverse swap as a success for 0.5.7.
+    fs.rmSync(backupPath);
+    fs.writeFileSync(
+      path.join(updatesDir, APPLY_LOG_NAME),
+      applyLogLines(
+        'started version=0.5.7 pid=3',
+        'waited-pid-gone',
+        'copy-ok attempts=1',
+        'relaunch-issued',
+        'done result=success version=0.5.7',
+      ),
+    );
+    const restored = createUpdater({
+      currentVersion: '0.5.7',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => liveExe,
+    });
+    const marker = restored.reconcileUpdateMarker();
+    assert.ok(marker && marker.backup === null && marker.restore === true, 'the restore confirms with no backup of its own');
+    assert.strictEqual(restored.getBackupInfo(), null, 'no second restore is offered');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.8 restore: refuses without a confirmed backup, and on non-portable runs', () => {
+  const root = updaterTmpRoot('restore-refusals');
+  try {
+    const bare = createUpdater({
+      currentVersion: '0.5.8',
+      userDataPath: root,
+      canApply: true,
+      getCurrentExePath: () => path.join(root, 'Muse-Portable.exe'),
+    });
+    assert.deepStrictEqual(bare.restorePrevious(), { ok: false, reason: 'no-backup' });
+
+    const updatesDir = path.join(root, 'updates');
+    fs.mkdirSync(updatesDir, { recursive: true });
+    fs.writeFileSync(path.join(root, BACKUP_EXE_NAME), 'the preserved 0.5.7 exe');
+    fs.writeFileSync(
+      path.join(updatesDir, LAST_UPDATE_MARKER_NAME),
+      JSON.stringify({ from: '0.5.7', to: '0.5.8', backup: '0.5.7', restore: false, at: '2026-10-27T00:00:00.000Z' }),
+    );
+    const nonPortable = createUpdater({
+      currentVersion: '0.5.8',
+      userDataPath: root,
+      canApply: false,
+      getCurrentExePath: () => path.join(root, 'Muse-Portable.exe'),
+    });
+    assert.ok(nonPortable.getBackupInfo(), 'the backup is real — only the swap is impossible');
+    assert.deepStrictEqual(nonPortable.restorePrevious(), { ok: false, reason: 'not-portable' });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.5.8 activity: the restore-start audit entry renders as a plain line', () => {
+  const lines = formatActivity([
+    { ts: '2026-10-27T03:00:00.000Z', event: 'update_restore_started', version: '0.5.7', decision: 'update-restore', outcome: 'started' },
+  ]);
+  assert.strictEqual(lines.length, 1);
+  assert.strictEqual(lines[0].summary, 'Update restore started: 0.5.7');
+  assert.strictEqual(lines[0].decision, 'restoring');
+  assert.strictEqual(lines[0].outcome, 'started');
+});
+
+test('0.5.8 wiring: settings Restore control, IPC, and the boot reconcile', () => {
+  const base = path.join(__dirname, '..', 'src');
+  const html = fs.readFileSync(path.join(base, 'settings', 'index.html'), 'utf8');
+  assert.ok(html.includes('id="restorePrevBtn"'), 'the Restore button exists');
+  assert.ok(html.includes('Restore previous version'), '...with the one control label');
+  assert.ok(html.includes('id="restoreRow"'), '...on its own row');
+  const preload = fs.readFileSync(path.join(base, 'settings', 'preload.js'), 'utf8');
+  assert.ok(
+    preload.includes("restorePrevious: () => ipcRenderer.invoke('settings:restore-previous')"),
+    'the preload exposes exactly the restore invoke',
+  );
+  const renderer = fs.readFileSync(path.join(base, 'settings', 'renderer.js'), 'utf8');
+  assert.ok(
+    renderer.includes("classList.toggle('hidden', !state.backupVersion)"),
+    'the row renders only while a backup exists',
+  );
+  assert.ok(renderer.includes('museSettings.restorePrevious()'), 'the button runs the invoke');
+  const handlers = fs.readFileSync(path.join(base, 'settingsHandlers.js'), 'utf8');
+  assert.ok(handlers.includes("'settings:restore-previous'"), 'the IPC handler is registered');
+  assert.ok(handlers.includes('backupVersion: backupVersion()'), 'the settings state carries the backup version');
+  const main = fs.readFileSync(path.join(base, 'main.js'), 'utf8');
+  assert.ok(
+    main.includes('restorePreviousUpdate: () => (updater ? updater.restorePrevious()'),
+    'the context routes the restore to the updater',
+  );
+  assert.ok(main.includes('updater.reconcileUpdateMarker();'), 'the boot judges the pending record');
 });
 
 // --- 0.5.1: screen.capture -------------------------------------------------

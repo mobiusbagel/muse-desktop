@@ -85,6 +85,9 @@ function describeEntry(entry) {
       if (entry.event === 'update_apply_started') {
         return `Update apply started: ${entry.version ?? ''}`.trim();
       }
+      if (entry.event === 'update_restore_started') {
+        return `Update restore started: ${entry.version ?? ''}`.trim();
+      }
       return 'Bridge call';
     default:
       return String(entry.method);
@@ -108,6 +111,8 @@ function decisionText(entry) {
       return 'auth rejected';
     case 'update-apply':
       return 'applying';
+    case 'update-restore':
+      return 'restoring';
     case 'scope-refused':
       return 'scope refused';
     case 'storage-moving':

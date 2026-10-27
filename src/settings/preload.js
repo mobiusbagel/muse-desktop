@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('museSettings', {
   saveCap: (gb) => ipcRenderer.invoke('settings:save-cap', gb),
   setRemoteAccess: (enabled) => ipcRenderer.invoke('settings:set-remote-access', enabled),
   checkUpdates: () => ipcRenderer.invoke('settings:check-updates'),
+  restorePrevious: () => ipcRenderer.invoke('settings:restore-previous'),
   setAutoCheck: (enabled) => ipcRenderer.invoke('settings:set-auto-check', enabled),
   pickFolder: () => ipcRenderer.invoke('settings:pick-folder'),
   precheckMove: (dest) => ipcRenderer.invoke('settings:precheck-move', dest),

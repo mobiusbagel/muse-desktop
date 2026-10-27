@@ -123,6 +123,11 @@ const context = {
           return s;
         })
       : Promise.resolve(null),
+  // Restore previous version (0.5.8): the settings window's one
+  // rollback control runs the updater's reverse swap; a successful
+  // start quits the app through the updater's onApplyStarted, like
+  // a forward apply.
+  restorePreviousUpdate: () => (updater ? updater.restorePrevious() : { ok: false, reason: 'no-updater' }),
   // The shared remote-access path (settingsHandlers) calls this
   // after a toggle so the tray menu's checkbox + status line stay
   // true no matter which surface flipped the setting.
@@ -516,6 +521,12 @@ if (!gotSingleInstanceLock) {
       },
       onApplyStarted: () => quitApp(),
     });
+    // 0.5.8: judge the pending record a previous apply left behind
+    // against the apply log (see updater.js) — a successful swap
+    // into THIS version becomes the confirmed last-update marker
+    // the settings Restore control reads; anything else is
+    // consumed without one.
+    updater.reconcileUpdateMarker();
     updater.cleanupStaleArtifacts();
     if (settings.autoCheckUpdates) {
       const launchCheckTimer = setTimeout(() => {
