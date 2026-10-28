@@ -60,6 +60,15 @@ function describeEntry(entry) {
       return `Write: ${params.path ?? ''}`;
     case 'fs.mkdir':
       return `Create folder: ${params.path ?? ''}`;
+    case 'fs.delete':
+      // Kind/count ride in the audit summary (rpc paramsSummary): a
+      // folder delete names its blast radius.
+      if (params.kind === 'directory') {
+        return `Delete folder: ${params.path ?? ''} (${params.count ?? 0} items)`;
+      }
+      return `Delete file: ${params.path ?? ''}`;
+    case 'fs.move':
+      return `Move: ${params.path ?? ''} → ${params.newPath ?? ''}`;
     case 'app.launch':
       return `Launch: ${params.target ?? ''}`;
     case 'process.list':

@@ -77,6 +77,17 @@
 // (confirmed marker + on-disk backup + strictly older), restore
 // as the reverse swap (backup consumed, restore audit line), and
 // the settings-window wiring (Restore control only with a backup).
+// 0.5.9 coverage: fs.list timestamps (createdAt/modifiedAt ISO
+// strings on files AND directories, size stays files-only), and the
+// fs.delete / fs.move bridge methods — delete of a file and of a
+// non-empty folder (recursive count in the result, the audit
+// summary, and the pre-approval prompt detail), move as rename +
+// relocate with both endpoints jailed (out-of-scope source OR
+// destination = scope_refused before any prompt), pre-gate refusals
+// (missing source, existing destination — both files survive,
+// folder into its own subtree), the Activity descriptions, and the
+// policy default: a stored permissions.json with no fs.delete /
+// fs.move keys behaves as "ask" for them, never allow, never crash.
 // Run: npm test
 'use strict';
 
@@ -475,7 +486,8 @@ test('process.kill: actually terminates a spawned process', async () => {
 test('unknown method: clean error', async () => {
   const env = makeEnv();
   const rpc = makeHandler(env);
-  await expectRpcError(rpc('fs.delete', { path: env.assistantFolder }), 'unknown_method');
+  // (Was fs.delete until 0.5.9 made it a real method.)
+  await expectRpcError(rpc('no.such.method', { path: env.assistantFolder }), 'unknown_method');
 });
 
 test('audit log: summaries carry paths but never file contents', async () => {
@@ -3560,6 +3572,245 @@ test('0.5.6 muse chords: main wires the chord action through sendChordWhenReady 
   assert.ok(main.includes('sendChordWhenReady({'), 'the chord goes through the load-guarded sender');
   assert.ok(main.includes('const chord = chordForTask(task);'), 'the chord resolves from the task name');
   assert.ok(!main.includes('executeJavaScript'), 'no script injection into the muse.ai page');
+});
+
+// --- 0.5.9: fs.list timestamps, fs.delete, fs.move -------------------------
+
+test('0.5.9 fs.list: entries carry createdAt/modifiedAt for files and directories', async () => {
+  const env = makeEnv();
+  const rpc = makeHandler(env);
+  const dir = path.join(env.assistantFolder, 'workspace');
+  fs.writeFileSync(path.join(dir, 'stamped.txt'), 'stamp');
+  fs.mkdirSync(path.join(dir, 'stamped-dir'));
+  const list = await rpc('fs.list', { path: dir });
+  assert.strictEqual(list.entries.length, 2);
+  for (const entry of list.entries) {
+    assert.strictEqual(typeof entry.createdAt, 'string', `${entry.name}: createdAt is a string`);
+    assert.strictEqual(typeof entry.modifiedAt, 'string', `${entry.name}: modifiedAt is a string`);
+    assert.ok(entry.createdAt.endsWith('Z'), `${entry.name}: createdAt is ISO 8601 UTC`);
+    assert.ok(!Number.isNaN(Date.parse(entry.createdAt)), `${entry.name}: createdAt parses`);
+    assert.ok(!Number.isNaN(Date.parse(entry.modifiedAt)), `${entry.name}: modifiedAt parses`);
+  }
+  const file = list.entries.find((e) => e.type === 'file');
+  const folder = list.entries.find((e) => e.type === 'directory');
+  assert.ok(file && folder, 'both a file and a directory entry are listed');
+  assert.strictEqual(file.size, 5, 'file size unchanged');
+  assert.strictEqual(folder.size, null, 'directory size stays null');
+});
+
+test('0.5.9 fs.delete: removes a file, result + audit name the kind', async () => {
+  const env = makeEnv({ 'fs.delete': 'allow' });
+  const rpc = makeHandler(env);
+  const target = path.join(env.assistantFolder, 'workspace', 'doomed.txt');
+  fs.writeFileSync(target, 'bye');
+  const result = await rpc('fs.delete', { path: target });
+  assert.strictEqual(result.kind, 'file');
+  assert.ok(result.path.endsWith('doomed.txt'));
+  assert.ok(!fs.existsSync(target), 'file is gone');
+  const last = env.auditEntries().at(-1);
+  assert.strictEqual(last.method, 'fs.delete');
+  assert.strictEqual(last.params.kind, 'file');
+  assert.strictEqual(last.outcome, 'ok');
+});
+
+test('0.5.9 fs.delete: removes a non-empty folder recursively, count reported', async () => {
+  const env = makeEnv({ 'fs.delete': 'allow' });
+  const rpc = makeHandler(env);
+  const dir = path.join(env.assistantFolder, 'shared', 'tree');
+  fs.mkdirSync(path.join(dir, 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'a');
+  fs.writeFileSync(path.join(dir, 'sub', 'b.txt'), 'b');
+  const result = await rpc('fs.delete', { path: dir });
+  assert.strictEqual(result.kind, 'directory');
+  assert.strictEqual(result.count, 3, 'two files + one subfolder');
+  assert.ok(!fs.existsSync(dir), 'the whole tree is gone');
+  assert.strictEqual(env.auditEntries().at(-1).params.count, 3, 'audit summary carries the count');
+});
+
+test('0.5.9 fs.delete: missing path is a clean error', async () => {
+  const env = makeEnv({ 'fs.delete': 'allow' });
+  const rpc = makeHandler(env);
+  const missing = path.join(env.assistantFolder, 'workspace', 'ghost.txt');
+  await expectRpcError(rpc('fs.delete', { path: missing }), 'invalid_params');
+});
+
+test('0.5.9 fs.delete: the prompt names the blast radius before approval', async () => {
+  const env = makeEnv({ 'fs.delete': 'ask' });
+  const dir = path.join(env.assistantFolder, 'shared', 'victims');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'one.txt'), '1');
+  fs.writeFileSync(path.join(dir, 'two.txt'), '2');
+  let seen = null;
+  const rpc = makeHandler(env, {
+    prompt: async (req) => {
+      seen = req;
+      return { allowed: true };
+    },
+  });
+  await rpc('fs.delete', { path: dir });
+  assert.strictEqual(seen.capability, 'fs.delete');
+  assert.ok(seen.detail.includes('Delete folder:'), `prompt says folder: ${seen.detail}`);
+  assert.ok(seen.detail.includes('(2 items)'), `prompt counts the contents: ${seen.detail}`);
+  assert.ok(!fs.existsSync(dir), 'the approved delete still executed');
+  assert.strictEqual(env.auditEntries().at(-1).decision, 'ask-granted');
+});
+
+test('0.5.9 policy: a stored policy without fs.delete/fs.move defaults them to ask', async () => {
+  // makeEnv's written policy predates both capabilities by
+  // construction (no keys for them) — the live install's permissions.json shape.
+  const env = makeEnv();
+  const policy = loadPolicy(env.userDataPath);
+  assert.strictEqual(policy.capabilities['fs.delete'], 'ask');
+  assert.strictEqual(policy.capabilities['fs.move'], 'ask');
+  assert.strictEqual(METHOD_CAPABILITY['fs.delete'], 'fs.delete');
+  assert.strictEqual(METHOD_CAPABILITY['fs.move'], 'fs.move');
+  // Behaviorally: the handler prompts rather than silently allowing,
+  // and a hand-stored "allow" is of course honored like any family's.
+  let seen = null;
+  const rpc = makeHandler(env, {
+    prompt: async (req) => {
+      seen = req;
+      return { allowed: true };
+    },
+  });
+  const target = path.join(env.assistantFolder, 'workspace', 'needs-asking.txt');
+  fs.writeFileSync(target, 'x');
+  await rpc('fs.delete', { path: target });
+  assert.strictEqual(seen.capability, 'fs.delete');
+  assert.strictEqual(env.auditEntries().at(-1).decision, 'ask-granted');
+});
+
+test('0.5.9 fs.move: renames a file in place', async () => {
+  const env = makeEnv({ 'fs.move': 'allow' });
+  const rpc = makeHandler(env);
+  const from = path.join(env.assistantFolder, 'workspace', 'before.txt');
+  const to = path.join(env.assistantFolder, 'workspace', 'after.txt');
+  fs.writeFileSync(from, 'payload');
+  const result = await rpc('fs.move', { path: from, newPath: to });
+  assert.ok(result.path.endsWith('before.txt'));
+  assert.ok(result.newPath.endsWith('after.txt'));
+  assert.ok(!fs.existsSync(from), 'source name is gone');
+  assert.strictEqual(fs.readFileSync(to, 'utf8'), 'payload');
+});
+
+test('0.5.9 fs.move: moves a file into another in-scope folder', async () => {
+  const env = makeEnv({ 'fs.move': 'allow' });
+  const rpc = makeHandler(env);
+  const from = path.join(env.assistantFolder, 'workspace', 'traveler.txt');
+  const to = path.join(env.assistantFolder, 'shared', 'traveler.txt');
+  fs.writeFileSync(from, 'on the move');
+  await rpc('fs.move', { path: from, newPath: to });
+  assert.ok(!fs.existsSync(from));
+  assert.strictEqual(fs.readFileSync(to, 'utf8'), 'on the move');
+  const last = env.auditEntries().at(-1);
+  assert.strictEqual(last.method, 'fs.move');
+  assert.ok(last.params.path.endsWith('traveler.txt'));
+  assert.ok(last.params.newPath.endsWith('traveler.txt'));
+});
+
+test('0.5.9 fs.move: out-of-scope source is scope_refused before any prompt', async () => {
+  const env = makeEnv({ 'fs.move': 'ask' });
+  let prompted = false;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompted = true;
+      return { allowed: true };
+    },
+  });
+  const outside = path.join(env.outsideFolder, 'theirs.txt');
+  fs.writeFileSync(outside, 'not yours');
+  await expectRpcError(
+    rpc('fs.move', { path: outside, newPath: path.join(env.assistantFolder, 'workspace', 'stolen.txt') }),
+    'scope_refused',
+  );
+  assert.strictEqual(prompted, false, 'scope refusal precedes the prompt');
+  assert.ok(fs.existsSync(outside), 'source untouched');
+});
+
+test('0.5.9 fs.move: out-of-scope destination is scope_refused before any prompt', async () => {
+  const env = makeEnv({ 'fs.move': 'ask' });
+  let prompted = false;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompted = true;
+      return { allowed: true };
+    },
+  });
+  const from = path.join(env.assistantFolder, 'workspace', 'mine.txt');
+  fs.writeFileSync(from, 'mine');
+  await expectRpcError(
+    rpc('fs.move', { path: from, newPath: path.join(env.outsideFolder, 'escaped.txt') }),
+    'scope_refused',
+  );
+  assert.strictEqual(prompted, false, 'scope refusal precedes the prompt');
+  assert.strictEqual(fs.readFileSync(from, 'utf8'), 'mine', 'source untouched');
+});
+
+test('0.5.9 fs.move: existing destination refuses before the prompt; both files survive', async () => {
+  const env = makeEnv({ 'fs.move': 'ask' });
+  let prompted = false;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompted = true;
+      return { allowed: true };
+    },
+  });
+  const from = path.join(env.assistantFolder, 'workspace', 'challenger.txt');
+  const to = path.join(env.assistantFolder, 'workspace', 'incumbent.txt');
+  fs.writeFileSync(from, 'challenger');
+  fs.writeFileSync(to, 'incumbent');
+  await expectRpcError(rpc('fs.move', { path: from, newPath: to }), 'invalid_params');
+  assert.strictEqual(prompted, false, 'an impossible move never reaches the prompt');
+  assert.strictEqual(fs.readFileSync(from, 'utf8'), 'challenger', 'no silent overwrite, no move');
+  assert.strictEqual(fs.readFileSync(to, 'utf8'), 'incumbent', 'destination content intact');
+});
+
+test('0.5.9 fs.move: a folder cannot move into its own subtree', async () => {
+  const env = makeEnv({ 'fs.move': 'allow' });
+  const rpc = makeHandler(env);
+  const parent = path.join(env.assistantFolder, 'shared', 'parent');
+  fs.mkdirSync(parent, { recursive: true });
+  fs.writeFileSync(path.join(parent, 'kid.txt'), 'kid');
+  await expectRpcError(
+    rpc('fs.move', { path: parent, newPath: path.join(parent, 'inner', 'parent') }),
+    'invalid_params',
+  );
+  assert.strictEqual(fs.readFileSync(path.join(parent, 'kid.txt'), 'utf8'), 'kid', 'folder untouched');
+});
+
+test('0.5.9 fs.move: missing source is refused', async () => {
+  const env = makeEnv({ 'fs.move': 'allow' });
+  const rpc = makeHandler(env);
+  await expectRpcError(
+    rpc('fs.move', {
+      path: path.join(env.assistantFolder, 'workspace', 'ghost.txt'),
+      newPath: path.join(env.assistantFolder, 'workspace', 'ghost-2.txt'),
+    }),
+    'invalid_params',
+  );
+});
+
+test('0.5.9 activity: delete and move summaries', () => {
+  assert.strictEqual(
+    describeEntry({ method: 'fs.delete', params: { path: 'C:\\Users\\you\\Muse\\a.txt', kind: 'file' } }),
+    'Delete file: C:\\Users\\you\\Muse\\a.txt',
+  );
+  assert.strictEqual(
+    describeEntry({
+      method: 'fs.delete',
+      params: { path: 'C:\\Users\\you\\Muse\\dir', kind: 'directory', count: 3 },
+    }),
+    'Delete folder: C:\\Users\\you\\Muse\\dir (3 items)',
+  );
+  assert.strictEqual(
+    describeEntry({ method: 'fs.delete', params: { path: 'C:\\Users\\you\\Muse\\a.txt' } }),
+    'Delete file: C:\\Users\\you\\Muse\\a.txt',
+    'a delete with no result in the log still describes as a file delete',
+  );
+  assert.strictEqual(
+    describeEntry({ method: 'fs.move', params: { path: 'C:\\a.txt', newPath: 'C:\\b.txt' } }),
+    'Move: C:\\a.txt → C:\\b.txt',
+  );
 });
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,8 @@ const CAPABILITY_LABELS = {
   'fs.list': 'List folder contents',
   'fs.read': 'Read a file',
   'fs.write': 'Write or create files/folders',
+  'fs.delete': 'Delete a file or folder',
+  'fs.move': 'Move or rename a file or folder',
   'app.launch': 'Launch an application',
   'process.list': 'List running processes',
   'process.kill': 'End a process',

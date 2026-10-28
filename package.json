@@ -53,5 +53,5 @@
     "test": "node tests/run-tests.js",
     "verify:portable": "node scripts/verify-portable.js"
   },
-  "version": "0.5.8"
+  "version": "0.5.9"
 }

@@ -17,6 +17,17 @@
 // it shares the screen.capture capability and its audit summary
 // carries the display count only.
 //
+// fs.delete / fs.move (0.5.9) complete the fs family. Each is its own
+// capability, defaulted to "ask"; a permissions.json written before
+// 0.5.9 has no key for them, and the policy loader defaults missing
+// keys to "ask" — never a crash, never a silent allow. fs.move jails
+// BOTH endpoints and refuses before the prompt when the source is
+// missing, the destination already exists, or a folder would move
+// into its own subtree. fs.delete's prompt names the blast radius
+// (file, or folder + recursive item count) computed pre-approval, and
+// its audit summary carries the kind/count from the result. fs.list
+// entries carry createdAt / modifiedAt timestamps since 0.5.9.
+//
 // One audit line is appended per call (see bridgeAudit.js).
 //
 // This module is deliberately Electron-free: the permission prompt and
@@ -66,6 +77,8 @@ const METHOD_CAPABILITY = {
   'fs.read': 'fs.read',
   'fs.write': 'fs.write',
   'fs.mkdir': 'fs.write',
+  'fs.delete': 'fs.delete',
+  'fs.move': 'fs.move',
   'app.launch': 'app.launch',
   'process.list': 'process.list',
   'process.kill': 'process.kill',
@@ -76,7 +89,7 @@ const METHOD_CAPABILITY = {
   'screen.list': 'screen.capture',
 };
 
-const FS_METHODS = new Set(['fs.list', 'fs.read', 'fs.write', 'fs.mkdir']);
+const FS_METHODS = new Set(['fs.list', 'fs.read', 'fs.write', 'fs.mkdir', 'fs.delete', 'fs.move']);
 // Methods refused with storage_moving while an assistant-folder move
 // runs: the fs tools (their scope is in flux), shell.run (its
 // working directory is the assistant folder being moved), and the
@@ -136,6 +149,64 @@ function assertInScope(canonicalTarget, settings, policy) {
     'scope_refused',
     `Path is outside the assistant folder and approved folders: ${canonicalTarget}`,
   );
+}
+
+// Recursive item count under a directory (files + folders) — the
+// blast radius an fs.delete prompt shows BEFORE approval. Unreadable
+// subfolders are skipped rather than failing the count: the same
+// mid-flight tolerance fs.list applies to vanishing entries.
+function countDirectoryItems(dir) {
+  let count = 0;
+  const pending = [dir];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      count += 1;
+      if (entry.isDirectory()) pending.push(path.join(current, entry.name));
+    }
+  }
+  return count;
+}
+
+// The fs.delete prompt description: what exactly is about to be
+// deleted — a file, or a folder with its recursive item count. A
+// missing target falls back to the bare path; execute() then refuses
+// it cleanly if the call is approved anyway.
+function describeDeleteTarget(canonicalTarget) {
+  let stat;
+  try {
+    stat = fs.statSync(canonicalTarget);
+  } catch {
+    return canonicalTarget;
+  }
+  if (!stat.isDirectory()) return `Delete file: ${canonicalTarget}`;
+  const count = countDirectoryItems(canonicalTarget);
+  return `Delete folder: ${canonicalTarget} (${count} item${count === 1 ? '' : 's'})`;
+}
+
+// fs.move's pre-gate refusals, checked after scoping and BEFORE the
+// prompt — the user is never asked to approve a move that cannot run:
+// the source must exist, the destination must not (no silent
+// overwrite), and a folder may not move into its own subtree.
+function assertMovable(canonicalSource, canonicalDestination) {
+  let stat;
+  try {
+    stat = fs.statSync(canonicalSource);
+  } catch {
+    throw new RpcError('invalid_params', `Source does not exist: ${canonicalSource}`);
+  }
+  if (fs.existsSync(canonicalDestination)) {
+    throw new RpcError('invalid_params', `Destination already exists: ${canonicalDestination}`);
+  }
+  if (stat.isDirectory() && isInsideDir(canonicalDestination, canonicalSource)) {
+    throw new RpcError('invalid_params', `Cannot move a folder into its own subtree: ${canonicalSource}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +408,16 @@ function paramsSummary(method, params, result) {
         path: params && params.path,
         bytes: params && typeof params.content === 'string' ? Buffer.byteLength(params.content, 'utf8') : 0,
       };
+    case 'fs.delete':
+      // Kind/count from the result, on success only (the
+      // screen.capture pattern) — a refused delete logs the bare path.
+      return {
+        path: params && params.path,
+        ...(result && typeof result.kind === 'string' ? { kind: result.kind } : {}),
+        ...(result && Number.isInteger(result.count) ? { count: result.count } : {}),
+      };
+    case 'fs.move':
+      return { path: params && params.path, newPath: params && params.newPath };
     case 'app.launch':
       return { target: params && params.target };
     case 'process.kill':
@@ -359,10 +440,16 @@ function paramsSummary(method, params, result) {
   }
 }
 
-function promptDetail(method, params, resolvedPath) {
+function promptDetail(method, params, resolvedPath, canonicalNewTarget) {
   switch (method) {
     case 'app.launch':
       return `Launch: ${params.target}`;
+    case 'fs.delete':
+      // Name + file-vs-folder + recursive count, computed now — the
+      // user approves the blast radius, not just a path.
+      return describeDeleteTarget(resolvedPath);
+    case 'fs.move':
+      return `Move: ${resolvedPath} → ${canonicalNewTarget}`;
     case 'process.kill':
       return `Kill process pid ${params.pid}`;
     case 'process.list':
@@ -479,7 +566,7 @@ function createRpcHandler(deps) {
     }
   }
 
-  async function execute(method, params, canonicalTarget, settings) {
+  async function execute(method, params, canonicalTarget, settings, canonicalNewTarget) {
     switch (method) {
       case 'fs.list': {
         const entries = fs.readdirSync(canonicalTarget, { withFileTypes: true });
@@ -488,13 +575,18 @@ function createRpcHandler(deps) {
             name: entry.name,
             type: entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other',
             size: null,
+            createdAt: null,
+            modifiedAt: null,
           };
-          if (entry.isFile()) {
-            try {
-              item.size = fs.statSync(path.join(canonicalTarget, entry.name)).size;
-            } catch {
-              // Vanished mid-listing; size stays null.
-            }
+          try {
+            const stat = fs.statSync(path.join(canonicalTarget, entry.name));
+            // Size stays files-only; timestamps are stat'd for every
+            // entry (0.5.9), directories included.
+            if (entry.isFile()) item.size = stat.size;
+            item.createdAt = stat.birthtime.toISOString();
+            item.modifiedAt = stat.mtime.toISOString();
+          } catch {
+            // Vanished mid-listing; size and timestamps stay null.
           }
           return item;
         });
@@ -524,6 +616,32 @@ function createRpcHandler(deps) {
       case 'fs.mkdir': {
         fs.mkdirSync(canonicalTarget, { recursive: true });
         return { path: canonicalTarget };
+      }
+      case 'fs.delete': {
+        let stat;
+        try {
+          stat = fs.statSync(canonicalTarget);
+        } catch {
+          throw new RpcError('invalid_params', `Path does not exist: ${canonicalTarget}`);
+        }
+        if (stat.isDirectory()) {
+          // Count BEFORE deleting: the result (and the audit line
+          // built from it) reports the recursive blast radius.
+          const count = countDirectoryItems(canonicalTarget);
+          fs.rmSync(canonicalTarget, { recursive: true });
+          return { path: canonicalTarget, kind: 'directory', count };
+        }
+        fs.unlinkSync(canonicalTarget);
+        return { path: canonicalTarget, kind: 'file' };
+      }
+      case 'fs.move': {
+        // Source/destination were validated before the gate
+        // (assertMovable). renameSync is the whole operation: both
+        // endpoints sit inside the same scoped roots, so this is a
+        // same-volume rename by construction — an EXDEV surprise is
+        // surfaced as-is, never papered over with copy+delete.
+        fs.renameSync(canonicalTarget, canonicalNewTarget);
+        return { path: canonicalTarget, newPath: canonicalNewTarget };
       }
       case 'app.launch': {
         if (typeof params.target !== 'string' || params.target.trim() === '') {
@@ -620,6 +738,7 @@ function createRpcHandler(deps) {
 
       // Scope first: never prompt for a path that will be refused anyway.
       let canonicalTarget = null;
+      let canonicalNewTarget = null;
       if (FS_METHODS.has(method)) {
         const rawPath = method === 'fs.list' && (params.path === undefined || params.path === '') ? '.' : params.path;
         canonicalTarget = resolveRequestedPath(rawPath, settings);
@@ -628,6 +747,25 @@ function createRpcHandler(deps) {
         } catch (err) {
           decision = 'scope-refused';
           throw err;
+        }
+        if (method === 'fs.move') {
+          // The destination is jailed with the same rules as the
+          // source: an out-of-scope newPath is scope_refused here,
+          // before any prompt, exactly like a bad source path.
+          if (typeof params.newPath !== 'string' || params.newPath.trim() === '') {
+            throw new RpcError('invalid_params', 'fs.move requires a non-empty string "newPath" parameter.');
+          }
+          canonicalNewTarget = resolveRequestedPath(params.newPath, settings);
+          try {
+            assertInScope(canonicalNewTarget, settings, policy);
+          } catch (err) {
+            decision = 'scope-refused';
+            throw err;
+          }
+          // Missing source / existing destination / folder into its
+          // own subtree: refused BEFORE the gate too (see
+          // assertMovable) — no prompt for a move that cannot run.
+          assertMovable(canonicalTarget, canonicalNewTarget);
         }
       }
 
@@ -645,7 +783,7 @@ function createRpcHandler(deps) {
           await askPermission({
             capability,
             method,
-            detail: promptDetail(method, params, canonicalTarget),
+            detail: promptDetail(method, params, canonicalTarget, canonicalNewTarget),
             // The prompt renders an "always allow" affordance only when
             // this is true; for shell.run it never is.
             canAlwaysAllow: !NEVER_ALLOW_CAPABILITIES.has(capability),
@@ -672,7 +810,7 @@ function createRpcHandler(deps) {
         decision = 'allow';
       }
 
-      const result = await execute(method, params, canonicalTarget, settings);
+      const result = await execute(method, params, canonicalTarget, settings, canonicalNewTarget);
       audit(method, params, decision, 'ok', undefined, result);
       return result;
     } catch (err) {

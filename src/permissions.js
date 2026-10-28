@@ -18,6 +18,8 @@ const DEFAULT_POLICY = {
     'fs.read': 'ask',
     'fs.write': 'ask',
     'fs.list': 'ask',
+    'fs.delete': 'ask',
+    'fs.move': 'ask',
     'app.launch': 'ask',
     'process.list': 'ask',
     'process.kill': 'ask',
