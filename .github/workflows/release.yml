@@ -74,8 +74,12 @@ jobs:
           $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw
           $cer = Join-Path $PWD "muse-signing-cert.cer"
           Export-Certificate -Cert $cert -FilePath $cer | Out-Null
-          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
-          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+          # Deliberately NO import into the Root / TrustedPublisher
+          # stores: that raises a consent dialog which hangs a
+          # non-interactive runner session (run #3, 2026-10-30).
+          # Nothing needs the chain to verify here — sign-exe.js and
+          # scripts\verify-signature.ps1 check the signer fingerprint
+          # against the pinned constant instead.
           Write-Host "Signing cert ready: $($cert.Subject)"
 
       - name: Build portable (pack, stamp, sign, portable, verify, sign)

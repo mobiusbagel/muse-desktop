@@ -12,11 +12,16 @@
 //   - Linux build VM: osslsigncode (no Wine, no Windows SDK here — the
 //     same constraint that produced scripts/stamp-exe.js).
 //   - Windows (the GitHub Actions release runner): signtool.exe from
-//     the Windows SDK, which the runner image carries. On Windows the
-//     workflow first imports the public cert into the user Trusted
-//     Root / Trusted Publisher stores, so `signtool verify /pa` can
-//     pass; on a Windows machine without that import, verify fails on
-//     the chain even though the signature itself is sound.
+//     the Windows SDK, which the runner image carries. Verification
+//     there does NOT use `signtool verify`: /pa needs the self-signed
+//     cert in a trust store, and importing it into the user Root
+//     store raises a consent dialog that hangs a non-interactive
+//     session indefinitely (release run #3, 2026-10-30 — the run had
+//     to be cancelled). Instead the signed file is verified exactly
+//     the way the in-app updater verifies a download: the signer
+//     certificate is extracted from the file and its SHA-256
+//     fingerprint compared with the constant pinned in
+//     src/updater.js.
 //
 // Certificate + password resolution, first hit wins:
 //   pfx:      $MUSE_SIGN_PFX          else signing/muse-signing.pfx
@@ -200,20 +205,17 @@ function signOneSigntool(filePath, password) {
     }
   }
 
-  let verifyOut;
-  try {
-    verifyOut = runSigntool(signtool, ['verify', '/pa', '/v', filePath]);
-  } catch (err) {
-    fail(
-      `signtool verify failed for ${filePath}: ${`${err.stdout || ''}${err.stderr || ''}`.trim() || err.message} ` +
-        '(on Windows, verify needs the public cert in the user Trusted Root store — the release workflow imports it)',
-    );
+  // Verify with the updater's own test (see the header): signer
+  // fingerprint extracted from the signed file must equal the pinned
+  // constant. No trust store is consulted, so nothing here can hang
+  // on a consent dialog.
+  const { signerFingerprint256FromExe, PINNED_SIGNER_FINGERPRINT256 } = require('../src/updater');
+  const fingerprint = signerFingerprint256FromExe(fs.readFileSync(filePath));
+  if (!fingerprint) fail(`no valid signature found in ${filePath} after signing`);
+  if (fingerprint !== PINNED_SIGNER_FINGERPRINT256) {
+    fail(`signer fingerprint mismatch for ${filePath}: got ${fingerprint}, pinned is ${PINNED_SIGNER_FINGERPRINT256}`);
   }
-  const verdict = verifyOut
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => /signer|timestamp|Successfully verified/i.test(line));
-  for (const line of verdict) console.log(`[sign-exe] verify ${path.basename(filePath)}: ${line}`);
+  console.log(`[sign-exe] verify ${path.basename(filePath)}: signer fingerprint matches the pinned Muse Desktop cert`);
   return timestamped;
 }
 
