@@ -32,6 +32,12 @@ Var AssistantFolderField
 Var AssistantFolderHandle
 
 Function MuseAssistantFolderPageCreate
+  ; Update install (0.6.2): settings.json already exists, so the
+  ; folder was chosen long ago - never re-ask. Aborting the create
+  ; function skips this page entirely.
+  IfFileExists "$APPDATA\Muse\settings.json" 0 muse_folder_page_show
+  Abort
+  muse_folder_page_show:
   StrCpy $AssistantParentPath "$PROFILE"
   nsDialogs::Create 1018
   Pop $AssistantFolderDialog
@@ -74,6 +80,12 @@ FunctionEnd
 !macroend
 
 !macro customInstall
+  ; Update install (0.6.2): settings.json already exists - write NO
+  ; hand-off file and create NO folders. The app owns the folder
+  ; choice from its first run on, and a stale hand-off must never
+  ; move it. (The app also ignores hand-offs on existing installs;
+  ; both sides guard because older installers still write one.)
+  IfFileExists "$APPDATA\Muse\settings.json" muse_custom_install_done
   ; If the custom page never ran, fall back to the default here too.
   StrCmp $AssistantFolderPath "" 0 install_write
   StrCpy $AssistantFolderPath "$PROFILE\Muse"
@@ -90,6 +102,7 @@ FunctionEnd
   CreateDirectory "$AssistantFolderPath"
   CreateDirectory "$AssistantFolderPath\Workspace"
   CreateDirectory "$AssistantFolderPath\Shared"
+  muse_custom_install_done:
 !macroend
 
 !endif ; BUILD_UNINSTALLER

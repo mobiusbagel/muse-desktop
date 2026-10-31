@@ -20,6 +20,15 @@
 // updates: a file the app writes itself carries no Mark of the Web,
 // unlike a browser download.
 //
+// 0.6.2: installed (Setup) runs get a real apply path too. Their
+// asset is the versioned installer (Muse-Setup-<version>.exe),
+// downloaded and verified through the exact same fail-closed
+// pipeline; applying launches the verified installer detached and
+// quits the app, and the per-user NSIS install swaps the build in
+// place. The rollback safety net (backup exe + restore) stays
+// portable-only: an installed build's previous version is the
+// previous Setup, not a file the app preserves.
+//
 // 0.5.2 reworked the apply mechanism (see "The self-swap" below):
 // in 0.5.0/0.5.1 the swap script was spawned as a child of the app
 // and died with the portable stub's process-tree teardown — the
@@ -144,10 +153,19 @@ function exeAssetName() {
   return EXE_ASSET_NAME;
 }
 
+// The installer asset is versioned (unlike the portable's fixed
+// name): Muse-Setup-<version>.exe, matching the artifactName in
+// package.json's NSIS config.
+function setupAssetName(version) {
+  return `Muse-Setup-${version}.exe`;
+}
+
 // Turns a GitHub "latest release" payload into an offer, or explains
 // why there is none. No offer unless the tag is strictly newer AND
-// both the exe asset and SHA256SUMS.txt are present.
-function parseLatestRelease(json, currentVersion) {
+// both the exe asset and SHA256SUMS.txt are present. assetKind picks
+// which exe this run needs: 'portable' (the fixed-name portable) or
+// 'setup' (the versioned installer, for installed runs).
+function parseLatestRelease(json, currentVersion, assetKind = 'portable') {
   if (!json || typeof json !== 'object' || typeof json.tag_name !== 'string') {
     return { offer: null, reason: 'no-tag' };
   }
@@ -155,7 +173,7 @@ function parseLatestRelease(json, currentVersion) {
   if (!parseVersion(version)) return { offer: null, reason: 'bad-tag' };
   if (!isNewerVersion(version, currentVersion)) return { offer: null, reason: 'not-newer' };
   const assets = Array.isArray(json.assets) ? json.assets : [];
-  const exeName = exeAssetName();
+  const exeName = assetKind === 'setup' ? setupAssetName(version) : exeAssetName();
   const exe = assets.find((a) => a && a.name === exeName);
   if (!exe || typeof exe.browser_download_url !== 'string') {
     return { offer: null, reason: 'missing-exe-asset' };
@@ -500,6 +518,16 @@ function buildSwapScript({ pid, currentExePath, newExePath, logPath, targetVersi
 
 // Fallback launcher (the 0.5.0 mechanism): a detached child of the
 // app. Only used when the WMI launch errors — a chance beats none.
+// Launches a verified Setup exe for an installed run's update
+// (0.6.2): detached and unref'd so it survives this app quitting,
+// which apply() triggers right after. No silent flag: the user sees
+// the installer run and finish, like any app update wizard.
+function defaultLaunchInstaller(exePath) {
+  const child = spawn(exePath, [], { detached: true, stdio: 'ignore' });
+  child.unref();
+  return child;
+}
+
 function defaultSpawnSwapScript(scriptPath) {
   const child = spawn(
     'powershell.exe',
@@ -731,6 +759,7 @@ function createUpdater(deps) {
     currentVersion,
     userDataPath,
     canApply = false,
+    canInstall = false,
     getCurrentExePath = () => process.env.PORTABLE_EXECUTABLE_FILE,
     fetchImpl = (...args) => globalThis.fetch(...args),
     downloadToFile = defaultDownloadToFile,
@@ -739,6 +768,7 @@ function createUpdater(deps) {
     onApplyStarted = () => {},
     spawnSwapScript = defaultSpawnSwapScript,
     launchSwapScript = defaultLaunchSwapScript,
+    launchInstaller = defaultLaunchInstaller,
     getPid = () => process.pid,
   } = deps;
 
@@ -752,7 +782,7 @@ function createUpdater(deps) {
   let inFlight = null;
 
   function getState() {
-    return { ...state, currentVersion, canApply, lastApplyOutcome: getLastApplyOutcome(), backup: getBackupInfo() };
+    return { ...state, currentVersion, canApply, canInstall, lastApplyOutcome: getLastApplyOutcome(), backup: getBackupInfo() };
   }
 
   // The last apply run's verdict from apply-update.log (0.5.2),
@@ -866,7 +896,11 @@ function createUpdater(deps) {
       return getState();
     }
 
-    const { offer, reason } = parseLatestRelease(json, currentVersion);
+    // Portable runs fetch the portable asset; installed runs fetch
+    // the Setup asset for the same release (0.6.2). Anything else
+    // (canInstall false) keeps the historical portable behavior.
+    const assetKind = canApply || !canInstall ? 'portable' : 'setup';
+    const { offer, reason } = parseLatestRelease(json, currentVersion, assetKind);
     if (!offer) {
       state = {
         ...state,
@@ -920,7 +954,7 @@ function createUpdater(deps) {
     }
 
     state = { ...state, state: 'ready', pendingVersion: offer.version, pendingExePath: exePath, error: null };
-    onReady({ version: offer.version, exePath, canApply });
+    onReady({ version: offer.version, exePath, canApply, canInstall });
     return getState();
   }
 
@@ -969,16 +1003,38 @@ function createUpdater(deps) {
     return { ok: true, via };
   }
 
-  // Applies the verified pending update. Only portable runs can
-  // replace their own exe; anything else is refused here (the UI
-  // disables the action with a one-line reason before this). The
-  // swap preserves the outgoing exe as the rollback backup (the
-  // script aborts if that copy cannot be made).
+  // Applies the verified pending update. Portable runs replace
+  // their own exe through the swap (which preserves the outgoing
+  // exe as the rollback backup — the script aborts if that copy
+  // cannot be made). Installed runs (0.6.2) launch the verified
+  // Setup exe and quit; the installer swaps the build in place.
+  // A run with neither path is refused here (the UI disables the
+  // action with a one-line reason before this).
   function apply() {
     if (state.state !== 'ready' || !state.pendingExePath) {
       return { ok: false, reason: 'no-verified-update' };
     }
-    if (!canApply) return { ok: false, reason: 'not-portable' };
+    if (!canApply) {
+      if (!canInstall) return { ok: false, reason: 'not-portable' };
+      // Installed path: no pending marker — reconcileUpdateMarker
+      // judges portable swap logs, and the rollback net stays
+      // portable-only. Audit, launch, quit, in that order.
+      try {
+        launchInstaller(state.pendingExePath);
+      } catch {
+        return { ok: false, reason: 'installer-launch-failed' };
+      }
+      audit({
+        ts: new Date().toISOString(),
+        event: 'update_install_started',
+        version: state.pendingVersion,
+        decision: 'update-install',
+        outcome: 'started',
+        via: 'installer',
+      });
+      onApplyStarted();
+      return { ok: true, via: 'installer' };
+    }
     const currentExePath = getCurrentExePath();
     if (!currentExePath) return { ok: false, reason: 'not-portable' };
     const launched = launchSwap({
@@ -1052,6 +1108,7 @@ module.exports = {
   compareVersions,
   isNewerVersion,
   exeAssetName,
+  setupAssetName,
   parseLatestRelease,
   sha256File,
   parseSha256Sums,

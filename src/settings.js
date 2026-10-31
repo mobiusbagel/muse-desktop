@@ -71,15 +71,24 @@ function ensureSettings(userDataPath) {
   // userData with the assistant folder the user picked during setup. The
   // first run folds that choice into settings.json and removes the file, so
   // settings.json is the single source of truth from then on.
+  // 0.6.2: the fold happens ONLY when settings.json was just created.
+  // An update install rewrites the hand-off file too (the installer's
+  // customInstall macro cannot tell an update from a first install on
+  // its own), and on any later run the file is stale by definition:
+  // it is removed and the saved folder stands. (The 0.6.2 installer
+  // also skips writing it on updates; this is the app-side belt to
+  // that installer's braces, and it covers older installers too.)
   const handoffFile = path.join(userDataPath, 'assistant-folder.txt');
   if (fs.existsSync(handoffFile)) {
     try {
       const chosen = fs.readFileSync(handoffFile, 'utf8').split(/\r?\n/)[0].trim();
-      if (chosen) {
+      if (chosen && created) {
         values.assistantFolder = chosen;
         dirty = true;
         fromInstaller = true;
         console.log('[settings] assistant folder chosen during install:', chosen);
+      } else if (chosen) {
+        console.log('[settings] ignored installer hand-off on an existing install:', chosen);
       }
       fs.rmSync(handoffFile, { force: true });
     } catch (err) {

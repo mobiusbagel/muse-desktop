@@ -210,7 +210,7 @@ function trayRestartToUpdate() {
   if (!updater) return;
   const s = updater.getState();
   if (s.state === 'ready' && s.pendingVersion) {
-    showUpdatePrompt({ version: s.pendingVersion, canApply: s.canApply });
+    showUpdatePrompt({ version: s.pendingVersion, canApply: s.canApply, canInstall: s.canInstall });
   }
 }
 
@@ -323,9 +323,12 @@ function quitApp() {
 }
 
 // The updater's only prompt (0.5.0): a verified download is ready.
-// Portable runs can apply it (self-swap); other runs get the one-line
-// reason instead of an action. "Later" keeps the verified file and
-// the offer comes back on the next launch's check.
+// Portable runs apply it by self-swap ("Restart to update");
+// installed runs apply it by launching the verified installer
+// (0.6.2, "Install update" — Muse closes and the Setup swaps the
+// build in place). A run with neither path gets the one-line reason
+// instead of an action. "Later" keeps the verified file and the
+// offer comes back on the next launch's check.
 let updatePromptOpen = false;
 function showUpdatePrompt(info) {
   if (updatePromptOpen) return;
@@ -335,10 +338,16 @@ function showUpdatePrompt(info) {
     title: 'Muse',
     message: `Muse ${info.version} is ready`,
   };
+  const actionable = Boolean(info.canApply || info.canInstall);
   if (info.canApply) {
     options.buttons = ['Restart to update', 'Later'];
     options.defaultId = 0;
     options.cancelId = 1;
+  } else if (info.canInstall) {
+    options.buttons = ['Install update', 'Later'];
+    options.defaultId = 0;
+    options.cancelId = 1;
+    options.detail = 'Muse will close and the verified installer will update it in place.';
   } else {
     options.buttons = ['OK'];
     options.detail = 'Updates can only be applied from the portable build.';
@@ -346,7 +355,7 @@ function showUpdatePrompt(info) {
   dialog
     .showMessageBox(options)
     .then(({ response }) => {
-      if (info.canApply && response === 0 && updater) updater.apply();
+      if (actionable && response === 0 && updater) updater.apply();
     })
     .catch(() => {})
     .finally(() => {
@@ -513,6 +522,9 @@ if (!gotSingleInstanceLock) {
       currentVersion: app.getVersion(),
       userDataPath,
       canApply: !!process.env.PORTABLE_EXECUTABLE_FILE,
+      // 0.6.2: anything that is not the portable build is an
+      // installed run, whose update path is the verified installer.
+      canInstall: !process.env.PORTABLE_EXECUTABLE_FILE,
       getCurrentExePath: () => process.env.PORTABLE_EXECUTABLE_FILE,
       audit: (entry) => appendAuditLog(userDataPath, entry),
       onReady: (info) => {

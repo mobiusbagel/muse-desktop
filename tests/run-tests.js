@@ -160,6 +160,7 @@ const {
   PINNED_SIGNER_FINGERPRINT256,
   EXE_ASSET_NAME,
   exeAssetName,
+  setupAssetName,
   parseVersion,
   compareVersions,
   isNewerVersion,
@@ -1922,6 +1923,138 @@ test('0.5.0 updater: non-portable runs verify but cannot apply', async () => {
     assert.deepStrictEqual(updater.apply(), { ok: false, reason: 'not-portable' });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function setupReleaseJson(version) {
+  return {
+    tag_name: `v${version}`,
+    assets: [
+      { name: 'Muse-Portable.exe', browser_download_url: 'https://example.test/Muse-Portable.exe' },
+      { name: `Muse-Setup-${version}.exe`, browser_download_url: `https://example.test/Muse-Setup-${version}.exe` },
+      { name: 'SHA256SUMS.txt', browser_download_url: 'https://example.test/SHA256SUMS.txt' },
+    ],
+  };
+}
+
+test('0.6.2 updater: parseLatestRelease setup kind wants the versioned installer asset', () => {
+  assert.strictEqual(setupAssetName('0.6.2'), 'Muse-Setup-0.6.2.exe');
+  const parsed = parseLatestRelease(setupReleaseJson('9.9.9'), '0.6.1', 'setup');
+  assert.strictEqual(parsed.offer.exeName, 'Muse-Setup-9.9.9.exe');
+  assert.strictEqual(parsed.offer.exeUrl, 'https://example.test/Muse-Setup-9.9.9.exe');
+  // Portable-only release + setup kind: no offer.
+  const missing = parseLatestRelease(releaseJson('9.9.9'), '0.6.1', 'setup');
+  assert.strictEqual(missing.offer, null);
+  assert.strictEqual(missing.reason, 'missing-exe-asset');
+  // Default kind stays the portable asset.
+  assert.strictEqual(parseLatestRelease(setupReleaseJson('9.9.9'), '0.6.1').offer.exeName, 'Muse-Portable.exe');
+});
+
+test('0.6.2 updater: installed run downloads + verifies the Setup and applies via the installer', async () => {
+  if (!haveUpdaterFixtures) {
+    console.log('     (skipped: signed dist fixture not present)');
+    return;
+  }
+  const root = updaterTmpRoot('flow-installed');
+  const readyInfos = [];
+  const audits = [];
+  let installerLaunched = null;
+  let applyStarted = false;
+  try {
+    const fixtureHash = crypto.createHash('sha256').update(fs.readFileSync(SIGNED_EXE_FIXTURE)).digest('hex');
+    const updater = createUpdater({
+      currentVersion: '0.6.1',
+      userDataPath: root,
+      canApply: false,
+      canInstall: true,
+      fetchImpl: jsonFetch(setupReleaseJson('9.9.9')),
+      downloadToFile: stubDownload([
+        ['.exe', (dest) => fs.copyFileSync(SIGNED_EXE_FIXTURE, dest)],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, `${fixtureHash}  Muse-Setup-9.9.9.exe\n`)],
+      ]),
+      audit: (entry) => audits.push(entry),
+      onReady: (info) => readyInfos.push(info),
+      launchInstaller: (exePath) => {
+        installerLaunched = exePath;
+      },
+      onApplyStarted: () => {
+        applyStarted = true;
+      },
+    });
+    const state = await updater.check();
+    assert.strictEqual(state.state, 'ready');
+    assert.strictEqual(state.canInstall, true);
+    assert.strictEqual(path.basename(state.pendingExePath), 'Muse-Setup-9.9.9.exe', 'the pending file is the installer');
+    assert.strictEqual(readyInfos[0].canApply, false);
+    assert.strictEqual(readyInfos[0].canInstall, true, 'the prompt is told to offer Install update');
+
+    assert.deepStrictEqual(updater.apply(), { ok: true, via: 'installer' });
+    assert.strictEqual(installerLaunched, state.pendingExePath, 'the verified installer is launched');
+    assert.strictEqual(applyStarted, true, 'the app is told to quit so the installer can swap the build');
+    const audit = audits.find((a) => a.event === 'update_install_started');
+    assert.ok(audit, 'the install is audited');
+    assert.strictEqual(audit.via, 'installer');
+    assert.strictEqual(audit.version, '9.9.9');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.6.2 updater: installed run gets no offer when the release lacks a Setup asset', async () => {
+  const root = updaterTmpRoot('flow-installed-nosetup');
+  let readyCalls = 0;
+  try {
+    const updater = createUpdater({
+      currentVersion: '0.6.1',
+      userDataPath: root,
+      canApply: false,
+      canInstall: true,
+      fetchImpl: jsonFetch(releaseJson('9.9.9')), // portable asset only
+      downloadToFile: stubDownload([
+        ['.exe', (dest) => fs.writeFileSync(dest, 'bytes')],
+        ['SHA256SUMS.txt', (dest) => fs.writeFileSync(dest, '')],
+      ]),
+      onReady: () => {
+        readyCalls += 1;
+      },
+    });
+    const state = await updater.check();
+    assert.strictEqual(state.state, 'error');
+    assert.strictEqual(state.error, 'missing-exe-asset');
+    assert.strictEqual(readyCalls, 0, 'nothing is offered');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('0.6.2 settings: an installer hand-off never moves the folder on an existing install', () => {
+  const dir = settingsTmpDir();
+  try {
+    fs.writeFileSync(
+      path.join(dir, 'settings.json'),
+      JSON.stringify({ assistantFolder: 'E:\\Kris\\Desktop\\Muse', maxStorageGB: 10 }),
+    );
+    fs.writeFileSync(path.join(dir, 'assistant-folder.txt'), 'C:\\Users\\you\\Muse');
+    const loaded = ensureSettings(dir);
+    assert.strictEqual(loaded.values.assistantFolder, 'E:\\Kris\\Desktop\\Muse', 'the saved folder stands');
+    assert.strictEqual(loaded.fromInstaller, false);
+    assert.strictEqual(fs.existsSync(path.join(dir, 'assistant-folder.txt')), false, 'the stale hand-off is removed');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('0.6.2 settings: a first install still adopts the installer hand-off', () => {
+  const dir = settingsTmpDir();
+  try {
+    fs.writeFileSync(path.join(dir, 'assistant-folder.txt'), 'D:\\Picked\\Muse');
+    const loaded = ensureSettings(dir);
+    assert.strictEqual(loaded.created, true);
+    assert.strictEqual(loaded.values.assistantFolder, 'D:\\Picked\\Muse');
+    assert.strictEqual(loaded.fromInstaller, true);
+    assert.strictEqual(fs.existsSync(path.join(dir, 'assistant-folder.txt')), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

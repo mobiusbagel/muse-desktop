@@ -56,5 +56,5 @@
     "start": "electron .",
     "test": "node tests/run-tests.js"
   },
-  "version": "0.6.1"
+  "version": "0.6.2"
 }

@@ -1,32 +1,36 @@
-# Muse Desktop 0.6.1
+# Muse Desktop 0.6.2
 
-**Bridge permission prompts can remember your choice now — including, carefully, shell commands.**
+**Installed builds can update in place now.**
 
-Every permission prompt on this PC gains a "Remember my choice"
-checkbox. What it buys depends on what is being asked:
+Through 0.6.1, a Muse installed from the Setup could *see* new
+releases but not apply them — the prompt just explained that
+updates are portable-only, and updating meant downloading and
+running the new Setup by hand. That gap is closed:
 
-- **Ordinary capabilities** (reading, writing, listing, deleting or
-  moving files, launching apps, processes, screenshots): remembering
-  sets that capability to "allow" in `permissions.json`, exactly what
-  the old "Always allow this capability" checkbox did — it just says
-  what it means now.
-- **`shell.run` is different, on purpose.** The checkbox there reads
-  "Remember this exact command." Only that command — byte for byte —
-  runs without asking from then on. Change one character, one space,
-  one quote, and it asks again. The `shell.run` capability itself
-  still can never be set to "allow": a hand-edited `permissions.json`
-  cannot make shell silent, and a stored "deny" for the capability
-  still beats the remembered list.
+- When an update is ready, an installed Muse now offers
+  **Install update**. Behind that button it downloads the new
+  `Muse-Setup-<version>.exe` and puts it through the same
+  fail-closed verification as always — SHA-256 against
+  `SHA256SUMS.txt` **and** the Authenticode signer fingerprint
+  against the pinned Muse Desktop certificate
+  (`0E:C7:DE:56:5D:F4:D6:70:32:07:47:5F:84:09:26:12:3D:03:BE:1B:8F:3D:38:C5:88:5F:22:D6:22:14:3B:DF`,
+  unchanged). Only a verified installer is ever launched. Muse
+  then closes and the Setup swaps the build in place; your
+  settings, permissions, and Bridge token live in userData and are
+  untouched.
+- **Skipping versions is fine.** The updater always offers the
+  latest release, so 0.6.0 installs jump straight here — and this
+  build includes everything from 0.6.1, including the
+  remember-my-choice permission prompts (per-capability remember;
+  `shell.run` remembers the exact command only).
+- **Update installs no longer re-ask where the Muse folder
+  lives.** The installer's folder page and its hand-off file are
+  first-install-only now, guarded on both sides (the installer
+  skips them when a settings file exists; the app ignores a stale
+  hand-off on an existing install), so an update can never move
+  your assistant folder by accident.
 
-Remembered commands live in `permissions.json` as `shellAllowlist`,
-next to the capability policies. Delete a line from that list and the
-command asks again. The Bridge audit log records these runs with the
-decision `allowlist`, so what ran on trust stays visible.
-
-Nothing else changes in 0.6.1: same Bridge tools, same prompts
-otherwise, same update path. **Updating works exactly as before** —
-the app downloads this release, verifies it (SHA-256 against
-`SHA256SUMS.txt` **and** the Authenticode signature against the
-Muse Desktop certificate, fingerprint unchanged:
-`0E:C7:DE:56:5D:F4:D6:70:32:07:47:5F:84:09:26:12:3D:03:BE:1B:8F:3D:38:C5:88:5F:22:D6:22:14:3B:DF`),
-and **Restart to update** swaps and relaunches it.
+Portable builds are unchanged: same self-swap, same "Restart to
+update," same one-generation rollback. The rollback net stays
+portable-only by design — an installed build's previous version is
+the previous Setup.
