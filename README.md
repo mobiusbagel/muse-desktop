@@ -39,7 +39,7 @@ on your PC, and a plain-language audit log of everything that happened.
   and rollback on failure.
 - **Local Bridge:** an HTTP API on `127.0.0.1:47631` with token auth,
   exposing permission-gated tools: `fs.list`, `fs.read`, `fs.write`,
-  `fs.mkdir`, `app.launch`, `process.list`, `process.kill`,
+  `fs.mkdir`, `fs.delete`, `fs.move`, `app.launch`, `process.list`, `process.kill`,
   `shell.run`, `screen.capture` (a PNG screenshot of one display,
   downscaled to at most 2560 px wide by default), and `screen.list`
   (the connected displays — size, DPI scale factor and primary flag,
@@ -70,11 +70,21 @@ on your PC, and a plain-language audit log of everything that happened.
 
 ## Install
 
-1. Download `Muse-Portable.exe` from the
-   [latest release](https://github.com/mobiusbagel/muse-desktop/releases/latest).
-   (The portable's name is version-free; the Settings window shows
-   the installed version.)
-2. Put it anywhere (Desktop is fine) and double-click.
+**Recommended — the installer:** download `Muse-Setup-<version>.exe`
+from the [latest release](https://github.com/mobiusbagel/muse-desktop/releases/latest)
+and run it. It's a per-user install (no admin prompt) with Start Menu
+and desktop shortcuts, and it starts instantly — no portable
+extraction step. One wizard page asks where the **Muse folder**
+should live: pick a parent location and a `Muse` folder is created
+there. That choice is applied on the app's first run, so if you
+already have a Muse folder from the portable, pick *its* parent
+location to keep using it — and quit the portable first, since both
+builds share the same data.
+
+**Or the portable:** download `Muse-Portable.exe` from the same
+release, put it anywhere (Desktop is fine), and double-click. (The
+portable's name is version-free; the Settings window shows the
+installed version.)
 
 ### One-time certificate trust (and an honest SmartScreen note)
 
@@ -121,14 +131,30 @@ npm start       # run the app from source
 npm test        # test suite (plain Node, tests/run-tests.js)
 npm run pack    # unpacked app dir (dist/win-unpacked)
 npm run dist:portable   # portable single-file exe from the packed dir
-npm run dist    # NSIS installer (needs Windows or Wine)
+npm run dist:setup      # NSIS installer from the packed dir (Windows)
+npm run dist    # NSIS installer from source (needs Windows or Wine)
 ```
 
-The full release pipeline is
+Releases are built by **GitHub Actions**: pushing a `v*` tag runs
+`.github/workflows/release.yml` on a Windows runner — test, build,
+sign, verify, publish — producing `Muse-Portable.exe`,
+`Muse-Setup-<version>.exe`, `SHA256SUMS.txt`, and the public signing
+cert, with the body taken from `RELEASE_NOTES.md`. Before anything
+publishes, each artifact's signer fingerprint is checked against the
+constant pinned in `src/updater.js` (`scripts/verify-signature.ps1`) —
+the same test the in-app updater applies to a download.
+
+The local equivalent of the pipeline is
 `pack → stamp → sign:inner → dist:portable → verify:portable → sign:outer`
-(`npm run release`). Signing needs [osslsigncode](https://github.com/mtrojnar/osslsigncode)
-and your own code-signing certificate in `signing/` (gitignored):
-`muse-signing.pfx`, `pfx-password.txt`, and `muse-signing-cert.pem`.
+(`npm run release`), then `npm run dist:setup` + `npm run sign:setup`
+for the installer. Signing reads the certificate and password from the
+environment when set (`MUSE_SIGN_PFX`, `MUSE_SIGN_PASSWORD` — the
+workflow feeds them from the repository secrets
+`MUSE_SIGN_PFX_BASE64` and `MUSE_SIGN_PASSWORD`) and otherwise from
+`signing/` (gitignored): `muse-signing.pfx`, `pfx-password.txt`, and
+`muse-signing-cert.pem`. On Linux it drives
+[osslsigncode](https://github.com/mtrojnar/osslsigncode); on Windows,
+signtool from the Windows SDK.
 Unsigned builds work fine; only signing and the release fail-safe care.
 
 **Forks:** the updater pins the Muse Desktop signer's fingerprint in

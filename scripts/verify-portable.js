@@ -45,7 +45,7 @@ function fail(message) {
 }
 
 function find7z() {
-  for (const name of ['7zz', '7z']) {
+  for (const name of ['7zz', '7z', '7z.exe', '7zz.exe']) {
     try {
       execFileSync(name, ['i'], { stdio: 'pipe' });
       return name;
@@ -53,7 +53,18 @@ function find7z() {
       // Not on PATH (or not runnable) — keep looking.
     }
   }
-  const cacheRoot = path.join(os.homedir(), '.cache', 'electron-builder');
+  if (process.platform === 'win32') {
+    // The GitHub Actions Windows image installs 7-Zip here without
+    // always putting it on PATH.
+    const programFiles7z = 'C:\\Program Files\\7-Zip\\7z.exe';
+    if (fs.existsSync(programFiles7z)) return programFiles7z;
+  }
+  const cacheRoot =
+    process.platform === 'win32' && process.env.LOCALAPPDATA
+      ? path.join(process.env.LOCALAPPDATA, 'electron-builder', 'Cache')
+      : process.platform === 'darwin'
+        ? path.join(os.homedir(), 'Library', 'Caches', 'electron-builder')
+        : path.join(os.homedir(), '.cache', 'electron-builder');
   const found = [];
   const walk = (dir, depth) => {
     if (depth > 6 || found.length > 0) return;
