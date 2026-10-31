@@ -40,9 +40,9 @@
   "main": "src/main.js",
   "name": "muse-desktop",
   "scripts": {
-    "dist": "electron-builder --win nsis",
-    "dist:portable": "electron-builder --win portable --prepackaged dist/win-unpacked",
-    "dist:setup": "electron-builder --win nsis --prepackaged dist/win-unpacked",
+    "dist": "electron-builder --win nsis --publish never",
+    "dist:portable": "electron-builder --win portable --prepackaged dist/win-unpacked --publish never",
+    "dist:setup": "electron-builder --win nsis --prepackaged dist/win-unpacked --publish never",
     "icons": "python3 scripts/make-icons.py",
     "pack": "electron-builder --win --dir",
     "release": "npm run pack && npm run stamp && npm run sign:inner && npm run dist:portable && npm run verify:portable && npm run sign:outer",
