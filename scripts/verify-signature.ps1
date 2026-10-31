@@ -7,11 +7,12 @@
 #      (PINNED_SIGNER_FINGERPRINT256 in src/updater.js — extracted from
 #      there when -Fingerprint is not passed), and
 #   2. the signature carries an RFC 3161 timestamp.
-# The signature Status may read Valid or NotTrusted: NotTrusted is the
-# expected verdict for a self-signed cert on any machine where the
-# public cert has not been installed, and is not a failure here. The
-# fingerprint equality is the check that matters. Any other status
-# (NotSigned, HashMismatch, ...) fails.
+# The signature Status may read Valid, NotTrusted, or UnknownError:
+# the latter two are what machines without the self-signed root
+# installed report for a sound signature (a hosted CI runner never
+# has it installed), and are not failures here. The fingerprint
+# equality is the check that matters. Any other status (NotSigned,
+# HashMismatch, ...) fails.
 #
 # Usage:
 #   .\scripts\verify-signature.ps1 -File dist\Muse-Portable.exe
@@ -32,7 +33,7 @@ if (-not $Fingerprint) {
 $expected = ($Fingerprint -replace "[:\s]", "").ToUpper()
 
 $sig = Get-AuthenticodeSignature $File
-if ($sig.Status -notin @("Valid", "NotTrusted")) {
+if ($sig.Status -notin @("Valid", "NotTrusted", "UnknownError")) {
     throw "$File : signature status is $($sig.Status) ($($sig.StatusMessage))"
 }
 if (-not $sig.SignerCertificate) {
