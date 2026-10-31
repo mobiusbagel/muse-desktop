@@ -1,5 +1,5 @@
 {
-  "author": "Muse Desktop",
+  "author": "Kris",
   "build": {
     "appId": "ai.muse.desktop",
     "directories": {
@@ -30,30 +30,31 @@
       "target": "nsis"
     }
   },
-  "description": "Muse desktop app for Windows \u2014 a standalone shell for muse.ai with system tray, global hotkey, and a local bridge with permission-gated tools, reachable over Tailscale when remote access is on (Phase 3).",
+  "description": "Muse desktop app for Windows — a standalone shell for muse.ai with system tray, global hotkey, and a local bridge with permission-gated tools, reachable over Tailscale when remote access is on (Phase 3).",
   "devDependencies": {
     "electron": "45.0.0",
     "electron-builder": "26.18.0",
     "resedit": "3.1.0"
   },
-  "license": "MIT",
+  "license": "UNLICENSED",
   "main": "src/main.js",
   "name": "muse-desktop",
+  "private": true,
   "scripts": {
     "dist": "electron-builder --win nsis --publish never",
     "dist:portable": "electron-builder --win portable --prepackaged dist/win-unpacked --publish never",
     "dist:setup": "electron-builder --win nsis --prepackaged dist/win-unpacked --publish never",
-    "icons": "python3 scripts/make-icons.py",
-    "pack": "electron-builder --win --dir",
-    "release": "npm run pack && npm run stamp && npm run sign:inner && npm run dist:portable && npm run verify:portable && npm run sign:outer",
-    "sign": "node scripts/sign-exe.js",
+    "stamp": "node scripts/stamp-exe.js dist/win-unpacked/Muse.exe",
+    "verify:portable": "node scripts/verify-portable.js",
     "sign:inner": "node scripts/sign-exe.js inner",
     "sign:outer": "node scripts/sign-exe.js outer",
     "sign:setup": "node scripts/sign-exe.js setup",
-    "stamp": "node scripts/stamp-exe.js dist/win-unpacked/Muse.exe",
+    "sign": "node scripts/sign-exe.js",
+    "release": "npm run pack && npm run stamp && npm run sign:inner && npm run dist:portable && npm run verify:portable && npm run sign:outer",
+    "icons": "python3 scripts/make-icons.py",
+    "pack": "electron-builder --win --dir",
     "start": "electron .",
-    "test": "node tests/run-tests.js",
-    "verify:portable": "node scripts/verify-portable.js"
+    "test": "node tests/run-tests.js"
   },
-  "version": "0.6.0"
+  "version": "0.6.1"
 }

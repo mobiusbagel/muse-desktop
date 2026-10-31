@@ -104,6 +104,8 @@ const {
   NEVER_ALLOW_CAPABILITIES,
   DEFAULT_POLICY,
   loadPolicy,
+  addShellCommand,
+  isShellCommandAllowed,
 } = require('../src/permissions');
 const {
   ScreenCaptureError,
@@ -1050,23 +1052,38 @@ test('0.4.0 permissions: effectivePolicyMode coerces a stored allow for shell.ru
   assert.strictEqual(effectivePolicyMode('fs.read', 'allow'), 'allow');
 });
 
-test('0.4.0 permissions: sanitizePromptAnswer strips alwaysAllow for shell.run only', () => {
+test('0.4.0/0.6.1 permissions: sanitizePromptAnswer strips capability-level alwaysAllow for shell.run only, remember survives', () => {
+  // For shell.run the capability-level half is forced off, but the
+  // remember intent survives as a per-command intent (0.6.1).
   assert.deepStrictEqual(sanitizePromptAnswer('shell.run', { allowed: true, alwaysAllow: true }), {
     allowed: true,
     alwaysAllow: false,
+    remember: true,
+  });
+  assert.deepStrictEqual(sanitizePromptAnswer('shell.run', { allowed: true, remember: true }), {
+    allowed: true,
+    alwaysAllow: false,
+    remember: true,
   });
   assert.deepStrictEqual(sanitizePromptAnswer('fs.read', { allowed: true, alwaysAllow: true }), {
     allowed: true,
     alwaysAllow: true,
+    remember: true,
+  });
+  assert.deepStrictEqual(sanitizePromptAnswer('fs.read', { allowed: true, remember: true }), {
+    allowed: true,
+    alwaysAllow: true,
+    remember: true,
   });
   assert.deepStrictEqual(sanitizePromptAnswer('shell.run', { allowed: false, timedOut: true }), {
     allowed: false,
     alwaysAllow: false,
+    remember: false,
     timedOut: true,
   });
 });
 
-test('0.4.0 shell.run: prompt payload carries the EXACT command and no always-allow path', async () => {
+test('0.4.0/0.6.1 shell.run: prompt payload carries the EXACT command and command-scoped remember', async () => {
   const env = makeEnv(); // shell.run defaults to "ask" via the policy defaults
   const longCommand = 'Get-ChildItem -Recurse | Where-Object { $_.Length -gt 1MB } | ' + 'Sort-Object Length; '.repeat(120);
   let seen = null;
@@ -1081,10 +1098,12 @@ test('0.4.0 shell.run: prompt payload carries the EXACT command and no always-al
   assert.deepStrictEqual(result, OK_SHELL_RESULT);
   assert.strictEqual(seen.capability, 'shell.run');
   assert.strictEqual(seen.detail, longCommand, 'the prompt detail is the command byte-for-byte, untruncated');
-  assert.strictEqual(seen.canAlwaysAllow, false, 'no always-allow path exists for shell.run');
+  // 0.6.1: no capability-level always-allow exists for shell.run; the
+  // remember checkbox is scoped to this exact command string.
+  assert.strictEqual(seen.rememberScope, 'command');
 });
 
-test('0.4.0 shell.run: other capabilities still get canAlwaysAllow=true in the payload', async () => {
+test('0.6.1: other capabilities get capability-scoped remember in the payload', async () => {
   const env = makeEnv({ 'fs.list': 'ask' });
   let seen = null;
   const rpc = makeHandler(env, {
@@ -1094,7 +1113,7 @@ test('0.4.0 shell.run: other capabilities still get canAlwaysAllow=true in the p
     },
   });
   await rpc('fs.list', { path: env.assistantFolder });
-  assert.strictEqual(seen.canAlwaysAllow, true);
+  assert.strictEqual(seen.rememberScope, 'capability');
 });
 
 test('0.4.0 shell.run: a stored "allow" still prompts (coerced at decision time)', async () => {
@@ -1113,21 +1132,98 @@ test('0.4.0 shell.run: a stored "allow" still prompts (coerced at decision time)
   assert.strictEqual(env.auditEntries().at(-1).decision, 'ask-granted');
 });
 
-test('0.4.0 shell.run: an alwaysAllow prompt answer is never persisted', async () => {
+test('0.6.1 shell.run: a remembered answer allowlists the EXACT command only — capability stays "ask"', async () => {
   const env = makeEnv();
   shellPolicy(env, 'ask');
   let prompts = 0;
   const rpc = makeHandler(env, {
     prompt: async () => {
       prompts += 1;
-      return { allowed: true, alwaysAllow: true }; // even if a prompt returned this
+      return { allowed: true, alwaysAllow: true }; // legacy-shaped answer: intent = remember
     },
     runShell: async () => OK_SHELL_RESULT,
   });
   await rpc('shell.run', { command: 'echo one' });
-  assert.strictEqual(env.readPolicy().capabilities['shell.run'], 'ask', 'shell.run must stay "ask" on disk');
+  const policy = env.readPolicy();
+  assert.strictEqual(policy.capabilities['shell.run'], 'ask', 'the shell.run CAPABILITY must stay "ask" on disk');
+  assert.deepStrictEqual(policy.shellAllowlist, ['echo one'], 'only the exact approved command is remembered');
   await rpc('shell.run', { command: 'echo two' });
-  assert.strictEqual(prompts, 2, 'the second call prompts again — nothing was persisted');
+  assert.strictEqual(prompts, 2, 'a different command prompts again');
+  await rpc('shell.run', { command: 'echo one' });
+  assert.strictEqual(prompts, 2, 'the remembered command runs without a prompt');
+  assert.strictEqual(env.auditEntries().at(-1).decision, 'allowlist');
+});
+
+test('0.6.1 permissions: addShellCommand persists exact strings once; loadPolicy normalizes the list', () => {
+  const env = makeEnv();
+  addShellCommand(env.userDataPath, 'echo hi');
+  addShellCommand(env.userDataPath, 'echo hi'); // duplicate: stored once
+  addShellCommand(env.userDataPath, 'echo hi '); // trailing space = a different command
+  addShellCommand(env.userDataPath, ''); // empty: ignored
+  const policy = loadPolicy(env.userDataPath);
+  assert.deepStrictEqual(policy.shellAllowlist, ['echo hi', 'echo hi ']);
+  assert.strictEqual(isShellCommandAllowed(policy, 'echo hi'), true);
+  assert.strictEqual(isShellCommandAllowed(policy, 'echo hi '), true);
+  assert.strictEqual(isShellCommandAllowed(policy, 'echo  hi'), false, 'matching is byte-identical');
+  assert.strictEqual(isShellCommandAllowed(policy, 'ECHO HI'), false);
+  // A hand-edited file with junk entries: non-strings are dropped on load.
+  const onDisk = env.readPolicy();
+  onDisk.shellAllowlist = ['echo ok', 42, null, { cmd: 'echo no' }];
+  env.writePolicy(onDisk);
+  assert.deepStrictEqual(loadPolicy(env.userDataPath).shellAllowlist, ['echo ok']);
+  // A policy file with no shellAllowlist key at all loads as an empty list.
+  const bare = env.readPolicy();
+  delete bare.shellAllowlist;
+  env.writePolicy(bare);
+  assert.deepStrictEqual(loadPolicy(env.userDataPath).shellAllowlist, []);
+  assert.deepStrictEqual(DEFAULT_POLICY.shellAllowlist, []);
+});
+
+test('0.6.1 shell.run: remember on the prompt allowlists; near-identical commands still prompt', async () => {
+  const env = makeEnv();
+  let prompts = 0;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompts += 1;
+      return { allowed: true, remember: true };
+    },
+    runShell: async () => OK_SHELL_RESULT,
+  });
+  await rpc('shell.run', { command: 'echo same' });
+  assert.deepStrictEqual(env.readPolicy().shellAllowlist, ['echo same']);
+  await rpc('shell.run', { command: 'echo same' });
+  assert.strictEqual(prompts, 1, 'exact match skips the prompt');
+  await rpc('shell.run', { command: 'echo same ' });
+  assert.strictEqual(prompts, 2, 'one trailing space is a different command and prompts');
+});
+
+test('0.6.1 shell.run: a DENIED prompt remembers nothing', async () => {
+  const env = makeEnv();
+  const rpc = makeHandler(env, {
+    prompt: async () => ({ allowed: false, remember: true }),
+    runShell: async () => OK_SHELL_RESULT,
+  });
+  await expectRpcError(rpc('shell.run', { command: 'echo nope' }), 'permission_denied');
+  const policy = env.readPolicy();
+  assert.ok(!Array.isArray(policy.shellAllowlist) || policy.shellAllowlist.length === 0);
+});
+
+test('0.6.1 shell.run: a stored capability "deny" beats the allowlist', async () => {
+  const env = makeEnv();
+  const policy = env.readPolicy();
+  policy.shellAllowlist = ['echo hi'];
+  env.writePolicy(policy);
+  shellPolicy(env, 'deny');
+  let prompts = 0;
+  const rpc = makeHandler(env, {
+    prompt: async () => {
+      prompts += 1;
+      return { allowed: true };
+    },
+    runShell: async () => OK_SHELL_RESULT,
+  });
+  await expectRpcError(rpc('shell.run', { command: 'echo hi' }), 'permission_denied');
+  assert.strictEqual(prompts, 0, 'deny refuses before any prompt, allowlist or not');
 });
 
 test('0.4.0 shell.run: prompt denial refuses and the runner never runs', async () => {
@@ -2640,6 +2736,7 @@ test('0.5.1 permissions: screen.capture defaults to ask and is standard-family (
   assert.deepStrictEqual(sanitizePromptAnswer('screen.capture', { allowed: true, alwaysAllow: true }), {
     allowed: true,
     alwaysAllow: true,
+    remember: true,
   });
   // An existing policy file without the key gains the default via the
   // loadPolicy defaults-merge (makeEnv's file has no screen.capture).
@@ -2699,7 +2796,7 @@ test('0.5.1 screen.capture: prompt payload is the one-line summary, always-allow
   await rpc('screen.capture', {});
   assert.strictEqual(seen[0].capability, 'screen.capture');
   assert.strictEqual(seen[0].detail, 'Take a screenshot — display 1, up to 2560px wide');
-  assert.strictEqual(seen[0].canAlwaysAllow, true);
+  assert.strictEqual(seen[0].rememberScope, 'capability');
   await rpc('screen.capture', { displayIndex: 1, maxWidth: 1920 });
   assert.strictEqual(seen[1].detail, 'Take a screenshot — display 2, up to 1920px wide');
   assert.strictEqual(describeCaptureRequest({}), 'Take a screenshot — display 1, up to 2560px wide');
@@ -2980,7 +3077,7 @@ test('0.5.3 screen.list: ask prompts once with the one-line summary; denial refu
   assert.strictEqual(seen[0].capability, 'screen.capture');
   assert.strictEqual(seen[0].method, 'screen.list');
   assert.strictEqual(seen[0].detail, 'List displays');
-  assert.strictEqual(seen[0].canAlwaysAllow, true);
+  assert.strictEqual(seen[0].rememberScope, 'capability');
   assert.strictEqual(env.auditEntries().at(-1).decision, 'ask-granted');
 
   const denyEnv = makeEnv();

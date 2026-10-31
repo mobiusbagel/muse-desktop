@@ -27,14 +27,23 @@ const DEFAULT_POLICY = {
     'screen.capture': 'ask',
   },
   approvedFolders: [],
+  // Exact shell command strings the user chose to remember (0.6.1).
+  // shell.run has NO capability-level "allow" — this list is the only
+  // way a command runs without a prompt, and only when the incoming
+  // command is byte-identical to an entry.
+  shellAllowlist: [],
 };
 
-// Capabilities that can NEVER run on a stored "allow" (0.4.0). A shell
-// command is arbitrary code: every single one must be seen and approved
-// on the PC. The dispatcher coerces a stored "allow" for these to "ask"
-// at decision time (effectivePolicyMode), and prompt answers for them
-// are stripped of any "always allow" (sanitizePromptAnswer) — so even a
-// hand-edited permissions.json or a prompt bug cannot make them silent.
+// Capabilities that can NEVER run on a stored capability-level "allow"
+// (0.4.0). A shell command is arbitrary code, so the CAPABILITY is never
+// silent: the dispatcher coerces a stored "allow" for these to "ask" at
+// decision time (effectivePolicyMode), and prompt answers for them are
+// stripped of any capability-level "always allow"
+// (sanitizePromptAnswer) — so even a hand-edited permissions.json or a
+// prompt bug cannot make the capability silent. The one exception,
+// added in 0.6.1, is per-command: an exact command string the user
+// explicitly remembered (shellAllowlist) runs without a prompt. That is
+// a list of individual commands, not a capability grant.
 const NEVER_ALLOW_CAPABILITIES = new Set(['shell.run']);
 
 // The mode a call actually runs under: a stored "allow" for a
@@ -45,14 +54,38 @@ function effectivePolicyMode(capability, mode) {
   return mode;
 }
 
-// Normalize a permission-prompt answer: for a never-allow capability the
-// "always allow" half is forced off, whatever the prompt returned.
+// Normalize a permission-prompt answer (0.6.1 "remember my choice").
+// The prompt's single checkbox arrives as `remember` (older answers may
+// carry it as `alwaysAllow`; both mean the same intent). What it buys
+// differs by capability:
+//   - normal capability: remember -> capability-level "allow"
+//     (alwaysAllow=true, persisted via setCapability);
+//   - never-allow capability (shell.run): the capability-level half is
+//     forced OFF, always — remember survives only as a per-command
+//     intent, which the dispatcher turns into a shellAllowlist entry
+//     for the exact command that was just approved.
 function sanitizePromptAnswer(capability, answer) {
+  // (Either flag counts: the prompt layer materializes both fields, so
+  // a legacy alwaysAllow-only answer must not be shadowed by a
+  // present-but-false remember.)
+  const remember = Boolean(answer && (answer.remember || answer.alwaysAllow));
   return {
     allowed: Boolean(answer && answer.allowed),
-    alwaysAllow: Boolean(answer && answer.alwaysAllow) && !NEVER_ALLOW_CAPABILITIES.has(capability),
+    alwaysAllow: remember && !NEVER_ALLOW_CAPABILITIES.has(capability),
+    remember,
     ...(answer && answer.timedOut ? { timedOut: true } : {}),
   };
+}
+
+// Is this exact command string on the remembered list? Byte-identical
+// comparison — any difference at all (whitespace, quoting, one char)
+// is a different command and prompts again.
+function isShellCommandAllowed(policy, command) {
+  return (
+    typeof command === 'string' &&
+    Array.isArray(policy && policy.shellAllowlist) &&
+    policy.shellAllowlist.includes(command)
+  );
 }
 
 function policyFilePath(userDataPath) {
@@ -83,6 +116,9 @@ function loadPolicy(userDataPath) {
       ...parsed,
       capabilities: { ...DEFAULT_POLICY.capabilities, ...(parsed.capabilities || {}) },
       approvedFolders: Array.isArray(parsed.approvedFolders) ? parsed.approvedFolders : [],
+      shellAllowlist: Array.isArray(parsed.shellAllowlist)
+        ? parsed.shellAllowlist.filter((entry) => typeof entry === 'string')
+        : [],
     };
   } catch {
     return JSON.parse(JSON.stringify(DEFAULT_POLICY));
@@ -102,15 +138,41 @@ function setCapability(userDataPath, capability, value) {
   parsed.capabilities = { ...DEFAULT_POLICY.capabilities, ...(parsed.capabilities || {}) };
   parsed.capabilities[capability] = value;
   if (!Array.isArray(parsed.approvedFolders)) parsed.approvedFolders = [];
+  if (!Array.isArray(parsed.shellAllowlist)) parsed.shellAllowlist = [];
   fs.mkdirSync(userDataPath, { recursive: true });
   fs.writeFileSync(file, JSON.stringify(parsed, null, 2) + '\n');
   console.log(`[permissions] capability ${capability} set to "${value}"`);
+}
+
+// Persist one remembered shell command (used when the user checks
+// "remember" on a shell.run prompt and allows). The exact string is
+// stored as-is; duplicates are not added twice. Other fields of the
+// file are preserved.
+function addShellCommand(userDataPath, command) {
+  if (typeof command !== 'string' || command === '') return;
+  const file = policyFilePath(userDataPath);
+  let parsed = {};
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    parsed = JSON.parse(JSON.stringify(DEFAULT_POLICY));
+  }
+  parsed.capabilities = { ...DEFAULT_POLICY.capabilities, ...(parsed.capabilities || {}) };
+  if (!Array.isArray(parsed.approvedFolders)) parsed.approvedFolders = [];
+  if (!Array.isArray(parsed.shellAllowlist)) parsed.shellAllowlist = [];
+  if (parsed.shellAllowlist.includes(command)) return;
+  parsed.shellAllowlist.push(command);
+  fs.mkdirSync(userDataPath, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(parsed, null, 2) + '\n');
+  console.log('[permissions] shell command added to allowlist');
 }
 
 module.exports = {
   ensurePermissionsPolicy,
   loadPolicy,
   setCapability,
+  addShellCommand,
+  isShellCommandAllowed,
   policyFilePath,
   DEFAULT_POLICY,
   NEVER_ALLOW_CAPABILITIES,

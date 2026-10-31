@@ -1,39 +1,32 @@
-# Muse Desktop 0.6.0
+# Muse Desktop 0.6.1
 
-**Releases are machine-built now — and there's a real installer.**
+**Bridge permission prompts can remember your choice now — including, carefully, shell commands.**
 
-The app itself is unchanged from 0.5.9: same Bridge, same tools,
-same behavior. What changed is how a release gets made, and what
-you can download.
+Every permission prompt on this PC gains a "Remember my choice"
+checkbox. What it buys depends on what is being asked:
 
-- **Built by GitHub Actions.** Every release from here on is built,
-  signed, and verified by the pipeline in
-  `.github/workflows/release.yml` when a version tag is pushed —
-  same steps as the hand-run chain (pack → stamp → sign → verify),
-  same certificate, with one new gate before anything publishes:
-  each artifact's signer fingerprint is checked against the exact
-  constant the in-app updater pins, the same test your running app
-  applies to a download before it dares apply it.
-- **`Muse-Setup-0.6.0.exe` — the installer is here.** A per-user
-  install (no admin prompt) with Start Menu and desktop shortcuts.
-  One page of the wizard asks where the **Muse folder** should
-  live: pick a parent location and a `Muse` folder is created
-  there with `Workspace` and `Shared` inside it. Two things worth
-  knowing: the choice you make in the installer is applied on the
-  app's first run, so if you already have a Muse folder, pick
-  *its* parent location to keep using it — and quit the portable
-  before installing, since the two builds share the same data.
-  An installed Muse also starts instantly: no portable extraction
-  step, ever.
-- **`SHA256SUMS.txt` now covers both downloads** (the portable and
-  the Setup). The old `Muse-win-unpacked` zip is retired; the
-  portable *is* the unpacked app, wrapped.
+- **Ordinary capabilities** (reading, writing, listing, deleting or
+  moving files, launching apps, processes, screenshots): remembering
+  sets that capability to "allow" in `permissions.json`, exactly what
+  the old "Always allow this capability" checkbox did — it just says
+  what it means now.
+- **`shell.run` is different, on purpose.** The checkbox there reads
+  "Remember this exact command." Only that command — byte for byte —
+  runs without asking from then on. Change one character, one space,
+  one quote, and it asks again. The `shell.run` capability itself
+  still can never be set to "allow": a hand-edited `permissions.json`
+  cannot make shell silent, and a stored "deny" for the capability
+  still beats the remembered list.
 
-**Updating from 0.5.9 works exactly as before** — an installed or
-portable build downloads this release, verifies it (SHA-256 against
+Remembered commands live in `permissions.json` as `shellAllowlist`,
+next to the capability policies. Delete a line from that list and the
+command asks again. The Bridge audit log records these runs with the
+decision `allowlist`, so what ran on trust stays visible.
+
+Nothing else changes in 0.6.1: same Bridge tools, same prompts
+otherwise, same update path. **Updating works exactly as before** —
+the app downloads this release, verifies it (SHA-256 against
 `SHA256SUMS.txt` **and** the Authenticode signature against the
 Muse Desktop certificate, fingerprint unchanged:
 `0E:C7:DE:56:5D:F4:D6:70:32:07:47:5F:84:09:26:12:3D:03:BE:1B:8F:3D:38:C5:88:5F:22:D6:22:14:3B:DF`),
-and **Restart to update** swaps and relaunches it. Switching to
-the installed build instead is a one-way door worth taking: run
-the Setup once, and every future release still arrives in-app.
+and **Restart to update** swaps and relaunches it.

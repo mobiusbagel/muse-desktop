@@ -41,6 +41,8 @@ const path = require('path');
 const {
   loadPolicy,
   setCapability,
+  addShellCommand,
+  isShellCommandAllowed,
   NEVER_ALLOW_CAPABILITIES,
   effectivePolicyMode,
   sanitizePromptAnswer,
@@ -533,7 +535,11 @@ function createRpcHandler(deps) {
             if (!settled) {
               settled = true;
               clearTimeout(timer);
-              resolve({ allowed: Boolean(answer && answer.allowed), alwaysAllow: Boolean(answer && answer.alwaysAllow) });
+              resolve({
+                allowed: Boolean(answer && answer.allowed),
+                alwaysAllow: Boolean(answer && answer.alwaysAllow),
+                remember: Boolean(answer && answer.remember),
+              });
             }
           },
           () => {
@@ -771,8 +777,21 @@ function createRpcHandler(deps) {
 
       // Effective mode: a stored "allow" for a never-allow capability
       // (shell.run) is coerced to "ask" HERE, at decision time — the
-      // file on disk is never trusted to make shell.run silent.
-      const mode = effectivePolicyMode(capability, policy.capabilities[capability] || 'ask');
+      // file on disk is never trusted to make the shell.run CAPABILITY
+      // silent.
+      let mode = effectivePolicyMode(capability, policy.capabilities[capability] || 'ask');
+      // 0.6.1: the single exception to "shell.run always asks" is a
+      // command the user explicitly remembered. The match is against
+      // the exact command string, byte for byte; a stored "deny" for
+      // the capability still wins over the list.
+      if (
+        mode === 'ask' &&
+        capability === 'shell.run' &&
+        isShellCommandAllowed(policy, params.command)
+      ) {
+        mode = 'allow';
+        decision = 'allowlist';
+      }
       if (mode === 'deny') {
         decision = 'deny';
         throw new RpcError('permission_denied', `Capability "${capability}" is set to "deny" in permissions.json.`);
@@ -784,9 +803,11 @@ function createRpcHandler(deps) {
             capability,
             method,
             detail: promptDetail(method, params, canonicalTarget, canonicalNewTarget),
-            // The prompt renders an "always allow" affordance only when
-            // this is true; for shell.run it never is.
-            canAlwaysAllow: !NEVER_ALLOW_CAPABILITIES.has(capability),
+            // What the prompt's "remember my choice" checkbox buys:
+            // 'capability' = a stored policy "allow" (never offered
+            // for shell.run); 'command' = this exact string goes on
+            // the shell allowlist.
+            rememberScope: NEVER_ALLOW_CAPABILITIES.has(capability) ? 'command' : 'capability',
           }),
         );
         if (!answer.allowed) {
@@ -806,7 +827,14 @@ function createRpcHandler(deps) {
             console.error('[rpc] could not persist "always allow":', err.message);
           }
         }
-      } else {
+        if (capability === 'shell.run' && answer.remember) {
+          try {
+            addShellCommand(userDataPath, params.command);
+          } catch (err) {
+            console.error('[rpc] could not persist remembered shell command:', err.message);
+          }
+        }
+      } else if (decision === 'none') {
         decision = 'allow';
       }
 

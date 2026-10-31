@@ -1,16 +1,19 @@
 // Permission prompt service (Phase 2).
 // Implements the prompt interface the RPC gate depends on:
-//   ask({ capability, method, detail, canAlwaysAllow }) -> Promise<{ allowed, alwaysAllow, timedOut? }>
+//   ask({ capability, method, detail, rememberScope }) -> Promise<{ allowed, alwaysAllow, remember, timedOut? }>
 // Each ask opens a small always-on-top window ON THIS PC naming the
 // capability and the exact path / command / pid requested. No answer
 // within the timeout (60s default) is a denial, as is closing the
 // window. Asks are serialized: one prompt at a time, in arrival order.
 //
-// Structural rule (0.4.0): for a never-allow capability (shell.run)
-// this service forces alwaysAllow off on EVERY answer it returns —
-// renderer response, timeout, window close — via sanitizePromptAnswer.
-// The renderer additionally doesn't render the checkbox for such
-// requests, but the guarantee lives here, not in the page.
+// Structural rule (0.4.0, scoped by 0.6.1): for a never-allow capability
+// (shell.run) this service forces the CAPABILITY-level alwaysAllow off
+// on EVERY answer it returns — renderer response, timeout, window
+// close — via sanitizePromptAnswer. The 0.6.1 "remember" checkbox is
+// rendered for every capability, but for shell.run it means "remember
+// this exact command" (a shellAllowlist entry), never a silent
+// capability; the guarantee lives here and in the dispatcher, not in
+// the page.
 //
 // The window is a LOCAL bundled page (src/prompt/) with the same
 // isolation rules as the settings window — nothing here is ever exposed
@@ -38,6 +41,7 @@ function createPermissionPromptService({ timeoutMs = 60_000 } = {}) {
       current.finish({
         allowed: Boolean(answer && answer.allowed),
         alwaysAllow: Boolean(answer && answer.alwaysAllow),
+        remember: Boolean(answer && answer.remember),
       });
     }
   });
