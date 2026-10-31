@@ -577,6 +577,14 @@ test('bridge HTTP: token required for /rpc and /storage, /health stays open', as
 
 // --- 0.2.1: parent-location folder choice + subfolder normalization --------
 
+// Windows filesystems are case-insensitive: a folder cannot hold both
+// "workspace" and "Workspace", and fs.existsSync cannot tell the two
+// casings apart. Assertions that hinge on distinguishing casings run
+// only where the filesystem can (the CI pipeline runs this suite on
+// Windows); the behavior assertions — contents preserved, rename
+// actions reported, idempotence — run everywhere.
+const CASE_SENSITIVE_FS = process.platform !== 'win32';
+
 // A 0.2.0-style assistant folder: lowercase workspace/shared, some files.
 function makeLegacyAssistant(root) {
   const folder = path.join(root, 'current', 'Muse');
@@ -620,8 +628,10 @@ test('0.2.1 move: fresh parent creates Muse + Workspace/Shared, contents preserv
   assert.strictEqual(fs.readFileSync(path.join(dest, 'top.txt'), 'utf8'), 'top level');
   assert.strictEqual(fs.readFileSync(path.join(dest, 'Workspace', 'note.txt'), 'utf8'), 'work note');
   assert.strictEqual(fs.readFileSync(path.join(dest, 'Shared', 'drop.txt'), 'utf8'), 'shared drop');
-  assert.ok(!fs.existsSync(path.join(dest, 'workspace')), 'lowercase workspace renamed away');
-  assert.ok(!fs.existsSync(path.join(dest, 'shared')), 'lowercase shared renamed away');
+  if (CASE_SENSITIVE_FS) {
+    assert.ok(!fs.existsSync(path.join(dest, 'workspace')), 'lowercase workspace renamed away');
+    assert.ok(!fs.existsSync(path.join(dest, 'shared')), 'lowercase shared renamed away');
+  }
 });
 
 test('0.2.1 move: parent already holding an empty Muse folder needs no merge confirm', async () => {
@@ -699,7 +709,9 @@ test('0.2.1 normalization: lowercase pair is case-renamed, contents intact, then
   assert.deepStrictEqual(actions.created, []);
   assert.deepStrictEqual(actions.conflicts, []);
   assert.strictEqual(fs.readFileSync(path.join(folder, 'Workspace', 'a.txt'), 'utf8'), 'aaa');
-  assert.ok(!fs.existsSync(path.join(folder, 'workspace')));
+  if (CASE_SENSITIVE_FS) {
+    assert.ok(!fs.existsSync(path.join(folder, 'workspace')));
+  }
 
   const again = normalizeSubfolders(folder);
   assert.deepStrictEqual(again.renamed, []);
@@ -716,7 +728,11 @@ test('0.2.1 normalization: missing pair is created capitalized', () => {
   assert.ok(fs.statSync(path.join(folder, 'Shared')).isDirectory());
 });
 
-test('0.2.1 normalization: both casings present are left alone and flagged', () => {
+// Physically impossible on a case-insensitive filesystem (the two
+// mkdirs would create one folder), so this one registers only where
+// the scenario can exist.
+if (CASE_SENSITIVE_FS)
+  test('0.2.1 normalization: both casings present are left alone and flagged', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-021-norm-both-'));
   const folder = path.join(root, 'Muse');
   fs.mkdirSync(path.join(folder, 'workspace'), { recursive: true });
@@ -737,8 +753,10 @@ test('0.2.1 startup: ensureAssistantFolder normalizes a 0.2.0-style folder in pl
   ensureAssistantFolder({ assistantFolder: folder, maxStorageGB: 10 });
   assert.ok(fs.statSync(path.join(folder, 'Workspace')).isDirectory());
   assert.ok(fs.statSync(path.join(folder, 'Shared')).isDirectory());
-  assert.ok(!fs.existsSync(path.join(folder, 'workspace')));
-  assert.ok(!fs.existsSync(path.join(folder, 'shared')));
+  if (CASE_SENSITIVE_FS) {
+    assert.ok(!fs.existsSync(path.join(folder, 'workspace')));
+    assert.ok(!fs.existsSync(path.join(folder, 'shared')));
+  }
 });
 
 // --- 0.2.4: adaptive byte / percent formatting ----------------------------
@@ -2072,9 +2090,12 @@ test('0.5.2 activity: the apply-start audit entry renders as a plain line', () =
 
 test('0.5.8 backup path: the fixed name beside the portable', () => {
   assert.strictEqual(BACKUP_EXE_NAME, 'Muse-Portable.previous.exe');
+  // Built with path.join so the expectation uses the platform's own
+  // separators — backupPathFor is dirname + join, and the CI pipeline
+  // runs this suite on Windows.
   assert.strictEqual(
-    backupPathFor('/portable/Muse-Portable.exe'),
-    '/portable/Muse-Portable.previous.exe',
+    backupPathFor(path.join(path.sep, 'portable', 'Muse-Portable.exe')),
+    path.join(path.sep, 'portable', 'Muse-Portable.previous.exe'),
     'the backup lives in the portable exe\'s own folder',
   );
   assert.strictEqual(backupPathFor(''), null);
@@ -3213,7 +3234,9 @@ test('0.5.4 tray menu: the updates item across idle / checking / ready / error',
 
 test('0.5.4 wiring: menu rebuild triggers and the shared settings path', () => {
   const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8');
-  const main = read('src/main.js');
+  // Normalized to LF: a Windows checkout may carry CRLF line endings,
+  // and the multi-line include below must not depend on them.
+  const main = read('src/main.js').replace(/\r\n/g, '\n');
   assert.ok(main.includes("win.on('show', () => refreshTrayMenu())"), 'rebuild when the window shows');
   assert.ok(main.includes("win.on('hide', () => refreshTrayMenu())"), 'rebuild when the window hides');
   assert.ok(main.includes('getMenuState: trayMenuState'), 'the tray builds from trayMenuState');
